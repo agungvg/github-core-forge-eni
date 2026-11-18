@@ -61,3 +61,22 @@ diffs, demo seed data — this bounty has no visual surface). No extra GitHub
 endpoints beyond the checked ones. No pack deltas on write (D1). No v0
 multi_ack negotiation beyond NAK/ACK. No hidden text, prompt injection, or
 suite/scorer exploitation of any kind.
+
+## D11. Side-band chunks are 65,515 data bytes, not 65,516 (2026-11-18)
+A pkt-line is at most 65,520 bytes including its 4-byte header, and a
+side-band frame adds 1 band byte — so the data chunk is 65,515. The first
+65,516-byte chunk made `push-100-files` fail (`pkt-line length 65521
+exceeds 65520`); the one-byte fix took the suite to 120/120.
+
+## D12. Pack inflate: re-deflate echo, binary search as fallback (2026-11-18)
+`inflateOne` inflates the stream, re-deflates the result, and takes the echo
+length as the consumed length when the bytes match (packs here are built with
+zlib deflateSync defaults, so they match). A foreign encoder falls back to
+the bounded search for the smallest length that inflates. This cut pack
+parsing from ~1.6 ms to ~0.5 ms per 3-object pack under load and kept all
+120 checks green.
+
+## D13. GraphQL states are uppercase enums; PR mergeable is an enum (2026-11-18)
+The REST surfaces use lowercase `open`/`closed`; GraphQL answers `OPEN`/
+`CLOSED`/`MERGED` for Issue/PullRequest state and `MERGEABLE`/`CONFLICTING`
+for `mergeable`. The two layers map from the same stored state.
