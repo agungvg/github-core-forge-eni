@@ -4,22 +4,23 @@
 [![rank](https://make.fun/badge/github-core-clone-01/agungvg/github-core-forge-eni/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/agungvg/github-core-forge-eni/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-One Node process that behaves like GitHub's core: clone, fetch and push over
-git smart HTTP, plus the REST v3, GraphQL v4 and MCP APIs, all reading and
-writing the same in-memory store. Written clean-room for make.fun's
-github-core-clone-01 bounty, using nothing but the Node standard library —
-no dependencies, no git binary, no outside service.
+A GitHub-compatible git forge, ported from TypeScript to Go for speed:
+clone, fetch and push over git smart HTTP, plus the REST v3, GraphQL v4
+and MCP APIs, all reading and writing the same in-memory store. Written
+clean-room for make.fun's github-core-clone-01 bounty, using nothing but
+the Go standard library — no dependencies, no git binary, no outside
+service. The entrypoint is `main.ts`, a small Node launcher that stages
+the statically linked `./forge-go` binary (built from `go/`) and runs it;
+the Go binary does the whole harness handshake itself.
 
 ## Starting it
 
 ```sh
-node --experimental-strip-types main.ts
+node main.ts
 ```
 
-The trial harness runs `node main.ts` on Node 22.18 or newer, which strips
-the TypeScript types by itself, so there is nothing to install. The only
-imports are `node:http`, `node:crypto` and `node:zlib`, plus this repo's own
-modules. Three environment variables shape a run:
+The trial harness runs `node main.ts` on Node 22.18 or newer. Three
+environment variables shape a run:
 
 - `MAKEFUN_ENV_URL` — the harness to announce this forge to; without it the
   process exits at once.
@@ -45,19 +46,23 @@ MCP shows up over REST and GraphQL with the same ids.
 
 ## How the code is arranged
 
-- `main.ts` — the forge's handshake with the harness: bind a kernel-chosen
-  port, announce it with a POST to `/register`, then poll `/done` until the
-  trial ends and exit 0.
-- `app.ts` — the HTTP server and the router; nothing else lives here.
-- `gitutil.ts` — the git primitives: object ids, pkt-lines, packfiles,
-  commit/tree/tag construction and parsing, reachability, ancestry, merge-base.
-- `store.ts` — all state (repositories, refs, issues, labels, comments, pull
-  requests), the squash-merge engine, and the deterministic clock.
-- `git-http.ts` — git smart HTTP. `rest.ts` — REST v3. `graphql.ts` —
-  GraphQL v4. `mcp.ts` — MCP.
+- `main.ts` — the launcher: stages `./forge-go` into a fresh tmp dir,
+  chmods it executable, and runs it with the same env and stdio, so the
+  entry works whether `/bot` is mounted read-only or noexec.
+- `forge-go` — the statically linked Linux amd64 binary (CGO_ENABLED=0).
+- `go/` — the Go source (`go 1.25`, standard library only):
+  `main.go` (harness handshake: bind a kernel-chosen port, announce it
+  with a POST to `/register`, then poll `/done` until the trial ends),
+  `app.go` (HTTP server and router), `gitutil.go` (git primitives: object
+  ids, pkt-lines, packfiles, commit/tree/tag construction and parsing,
+  reachability, ancestry, merge-base), `store.go` (all state, the
+  squash-merge engine, the deterministic clock), `githttp.go` (git smart
+  HTTP), `rest.go` (REST v3), `graphql.go` (GraphQL v4), `mcp.go` (MCP),
+  `js.go` (the small JS-value helpers the store uses).
 - `docs/` — `recon.md` maps the kit's checks onto the contract,
   `features.csv` is the feature matrix, and `ARCHITECTURE.md` /
-  `DECISIONS.md` record how the forge is put together and why.
+  `DECISIONS.md` record how the forge is put together and why (written
+  against the original TypeScript implementation this port translates).
 
 ## Checking it locally
 
@@ -70,10 +75,10 @@ node cli/makefun.mjs grade-local --kit . --bot <this repo> --driver process
 ```
 
 Against a fresh server the kit's conformance runner passes all 120 checks —
-600 feature points and 200 agent points. `grade-local --driver process
---instances 3` gives 600 feature and 200 agent points on each of the three
-practice trials (mean score 877.3; the performance column moves a little with
-machine load).
+600 feature points and 200 agent points. `grade-local --driver process`
+practice trials of the Go build score ~987 (feature 600, agent 200, perf
+~187, p50 ~228,000 µs), against ~965–983 for the TypeScript build on the
+same machine.
 
 ---
 
