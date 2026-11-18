@@ -1,0 +1,46 @@
+feature,surface,priority,status,checks
+boot/register/healthz,lifecycle,P0,building,env boot: listen(0) register poll done; GET /healthz 200 {"ok":true}
+git v2 advertisement,git,P0,building,advertise-v2; advertise-headers
+git v0 advertisement upload-pack,git,P0,building,advertise-v2 (v0 fallback); advertise-headers
+git v0 advertisement receive-pack,git,P0,building,advertise-receive-pack
+git unknown repo 404,git,P0,building,unknown-repo-404
+git v2 ls-refs (+peel/symrefs/unborn/prefix),git,P0,building,ls-refs; ls-refs-prefix
+git clone empty repo,git,P0,building,clone-empty
+git push first commit,git,P0,building,push-first-commit
+git clone object hashes/bytes,git,P0,building,clone-object-hashes; clone-blob-bytes; clone-tree-entries; clone-commit-bytes
+git clone annotated tag,git,P0,building,clone-annotated-tag
+git fetch incremental,git,P0,building,fetch-incremental
+git fetch nothing new,git,P0,building,fetch-nothing-new
+git fetch shallow depth1/deepen/new-tip,git,P0,building,fetch-shallow-depth1; fetch-shallow-deepen; fetch-shallow-new-tip
+git push update/create/delete branch,git,P0,building,push-update-ref; push-create-branch; push-delete-branch
+git push non-fast-forward + mixed report,git,P0,building,push-non-fast-forward; push-mixed-report
+git push delete tag,git,P0,building,push-delete-tag
+git push 100 files,git,P0,building,push-100-files
+git pack integrity + deltas (0 deltas ok),git,P0,building,pack-integrity; pack-deltas
+git sideband framing + push report,git,P0,building,sideband-framing; push-sideband-report
+git repo survives malformed POST,git,P0,building,repo-survives-errors
+rest root + meta + request-id + json,rest,P0,building,root; meta; content-type-json; request-id; error-message; unknown-route-json-404; malformed-body-400
+rest auth 401 + foreign owner 404,rest,P0,building,unauthorized; foreign-token
+rest repo create/list/pagination,rest,P0,building,create; pagination; not-found; patch; delete
+rest branches/commits/refs,rest,P0,building,branches; commits
+rest contents create/update/delete/dir/stale-sha,rest,P0,building,contents-create; contents-directory; contents-stale-sha; contents-delete
+rest labels + issue create (bad label 422),rest,P0,building,create-labels; create; create-title-body; bad-label
+rest issue numbers/list/sort/shape/get/patch/comments,rest,P0,building,numbers-increment; list-open; list-open-excludes-closed; list-sort-asc; list-sort-desc; list-shape; get-one; patch-close; patch-close-persists; comment-create; comments-list
+rest pull create/get/files/list,rest,P0,building,create; create-body; create-head-sha; create-base-sha; get-one; files-list; files-shape; files-multiple; list-state-all; list-default-open; list-shape; get-unknown
+rest pull merge squash + conflict + unknown,rest,P0,building,merge-status; merge-body; merge-closes; merge-commit-on-default; merge-content-on-default; merge-commit-sha; merge-unknown; merge-conflict
+graphql viewer + repository fields,graphql,P0,building,viewer-login; repository-fields
+graphql introspection Issue/PullRequest/Repository/SearchType,graphql,P0,building,introspection-issue; introspection-types
+graphql issues open order + by number + pagination,graphql,P0,building,issues-open-order; issue-by-number; issues-pagination
+graphql create/close issue + add comment,graphql,P0,building,create-issue; close-issue; add-comment
+graphql pull requests list/files/create/merge,graphql,P0,building,pull-requests-list; pull-request-files; create-pull-request; merge-pull-request
+graphql invalid field / unauthenticated / node / unknown repo / batch / global ids,graphql,P0,building,invalid-field; unauthenticated; node-repository; unknown-repository; batched-operations; global-id-stability
+mcp discover + initialize + tools/list, mcp,P0,building,server-discover; initialize; tools-list; tool-schemas; tools-list-idempotent
+mcp create/list issue + create/merge PR + rest parity,mcp,P0,building,create-issue; list-issues; create-pull-request; merge-pull-request; rest-parity
+mcp unknown tool / parse error / missing args / concurrent / auth,mcp,P0,building,unknown-tool; parse-error; missing-arguments; concurrent-calls; auth-required
+perf push 200x1KiB (T_ref 1640.82ms),perf,P1,building,bench push
+perf clone 50x shallow depth1 200-commit (266.941ms),perf,P1,building,bench clone
+perf read 2000 GET issue keep-alive (2759.715ms),perf,P1,building,bench read
+perf write 200 issue creates (348.965ms),perf,P1,building,bench write
+perf pack deltas on write,perf,P2,cut,whole-object packs only (D1); 0 deltas passes pack-deltas
+extra REST endpoints (search/users/rate_limit),rest,P2,cut,not in any check; only / and /meta served
+design tokens / component specs / screenshots / demo seed data,ui,P2,cut,no visual surface in this bounty (D10)
