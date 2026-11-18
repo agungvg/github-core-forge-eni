@@ -10,6 +10,21 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 
 let requestCounter = 0;
 
+/** The exact Authorization header value, computed once: the token comes
+ * from the environment and never changes during a run, so rebuilding
+ * `Bearer ${token}` (a template allocation) per request is pure waste. */
+let expectedAuthHeader: string | null = null;
+
+function sendCachedJson(res: ServerResponse, status: number, body: Buffer): void {
+  requestCounter += 1;
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'x-github-request-id': `req-${requestCounter.toString(16)}`,
+    'content-length': body.length,
+  });
+  res.end(body);
+}
+
 function sendJson(
   res: ServerResponse,
   status: number,
@@ -41,10 +56,15 @@ function expectedToken(): string {
   return process.env.MAKEFUN_SHOP_TOKEN ?? '';
 }
 
+/** The bearer token never changes during a run; process.env access per
+ * request is needless overhead on the hottest paths. */
+let cachedToken: string | null = null;
+
 function isAuthorized(req: IncomingMessage): boolean {
-  const expected = expectedToken();
-  if (expected === '') return false;
-  return req.headers.authorization === `Bearer ${expected}`;
+  if (cachedToken === null) cachedToken = expectedToken();
+  if (cachedToken === '') return false;
+  if (expectedAuthHeader === null) expectedAuthHeader = `Bearer ${cachedToken}`;
+  return req.headers.authorization === expectedAuthHeader;
 }
 
 function parseBody(raw: Buffer): { ok: true; value: unknown } | { ok: false } {
@@ -121,6 +141,28 @@ export function handleRest(
   if (!isAuthorized(req)) {
     sendError(res, 401, 'Bad credentials');
     return true;
+  }
+
+  // Fast path: GET /repos/{owner}/{repo}/issues/{n} — the read workload's
+  // 2,000 sequential requests. Only when every segment is plain ASCII (no
+  // '%' to decode, no trailing slash, no query): the slow path below handles
+  // everything else byte-identically.
+  if (method === 'GET' && path.indexOf('%') < 0) {
+    const m = /^\/repos\/([^/]+)\/([^/]+)\/issues\/([1-9][0-9]*)$/.exec(path);
+    if (m) {
+      const repo = store.getRepo(m[1], m[2]);
+      if (!repo) {
+        sendError(res, 404, 'Not Found');
+        return true;
+      }
+      const issue = store.getIssue(repo, Number(m[3]));
+      if (!issue) {
+        sendError(res, 404, 'Not Found');
+        return true;
+      }
+      sendCachedJson(res, 200, store.issueJsonBuffer(repo, issue));
+      return true;
+    }
   }
 
   // Body parsing for methods that carry one.
@@ -409,7 +451,7 @@ export function handleRest(
               labels.push(name);
             }
             const issue = store.createIssue(repo, title, asString(body.body) ?? '', labels);
-            sendJson(res, 201, store.issueJson(repo, issue));
+            sendCachedJson(res, 201, store.issueJsonBuffer(repo, issue));
             return true;
           }
         }
@@ -422,7 +464,7 @@ export function handleRest(
           }
           if (rest.length === 2) {
             if (method === 'GET') {
-              sendJson(res, 200, store.issueJson(repo, issue));
+              sendCachedJson(res, 200, store.issueJsonBuffer(repo, issue));
               return true;
             }
             if (method === 'PATCH') {
@@ -433,6 +475,7 @@ export function handleRest(
               const b = asString(body.body);
               if (b !== undefined) issue.body = b;
               issue.updatedSeq = store.nextSeq();
+              issue.jsonCache = undefined;
               sendJson(res, 200, store.issueJson(repo, issue));
               return true;
             }

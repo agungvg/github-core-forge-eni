@@ -167,6 +167,32 @@ export function parseCommit(data: Buffer): CommitInfo {
   return { tree, parents, author, committer, message };
 }
 
+/**
+ * Hot-path commit parse: only the tree and parents, no identity regexes and
+ * no message handling. Walk/ancestry code only ever needs these two fields;
+ * the regexes in parseIdentity are the most expensive part of a full parse.
+ * Byte-identical results for `tree`/`parents` (same header scan, same trims).
+ */
+export function parseCommitLight(data: Buffer): { tree: string; parents: string[] } {
+  const text = data.toString('utf8');
+  const split = text.indexOf('\n\n');
+  const head = split < 0 ? text : text.slice(0, split);
+  let tree = '';
+  const parents: string[] = [];
+  let start = 0;
+  for (;;) {
+    const nl = head.indexOf('\n', start);
+    const line = nl < 0 ? head.slice(start) : head.slice(start, nl);
+    if (line.length > 0 && line.charCodeAt(0) !== 0x20) {
+      if (line.startsWith('tree ')) tree = line.slice(5).trim();
+      else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
+    }
+    if (nl < 0) break;
+    start = nl + 1;
+  }
+  return { tree, parents };
+}
+
 export function buildCommit(c: CommitInfo): Buffer {
   let out = `tree ${c.tree}\n`;
   for (const p of c.parents) out += `parent ${p}\n`;
@@ -514,12 +540,15 @@ export function walkCommits(
 ): { commits: Set<string>; boundary: Set<string> } {
   const commits = new Set<string>();
   const boundary = new Set<string>();
+  // Index-based queue: Array.shift() is O(n) per pop, which made every walk
+  // O(n^2) in the chain length (clone's full walk, push ancestry, merges).
   const queue: Array<{ oid: string; depth: number }> = [];
+  let head = 0;
   for (const tip of tips) {
     if (isOid(tip) && !commits.has(tip)) queue.push({ oid: tip, depth: 0 });
   }
-  while (queue.length > 0) {
-    const { oid, depth } = queue.shift()!;
+  while (head < queue.length) {
+    const { oid, depth } = queue[head++]!;
     if (commits.has(oid)) continue;
     const obj = store.get(oid);
     if (!obj || obj.type !== 'commit') continue;
@@ -528,7 +557,7 @@ export function walkCommits(
       boundary.add(oid);
       continue;
     }
-    const info = parseCommit(obj.data);
+    const info = parseCommitLight(obj.data);
     if (opts.maxDepth !== undefined && depth >= opts.maxDepth) {
       if (info.parents.length > 0) boundary.add(oid);
       continue;
@@ -547,7 +576,7 @@ export function collectReachable(store: ObjectStore, commitOids: ReadonlySet<str
     const obj = store.get(oid);
     if (!obj || obj.type !== 'commit' || out.has(oid)) return;
     out.set(oid, obj);
-    const info = parseCommit(obj.data);
+    const info = parseCommitLight(obj.data);
     visitTree(info.tree);
     for (const p of info.parents) visitCommit(p);
   };
@@ -605,7 +634,7 @@ export function collectCommitObjects(store: ObjectStore, commitOids: ReadonlySet
     if (!obj) continue;
     if (obj.type === 'commit') {
       out.set(oid, obj);
-      visitTree(parseCommit(obj.data).tree);
+      visitTree(parseCommitLight(obj.data).tree);
     } else if (obj.type === 'tag') {
       out.set(oid, obj);
       const tag = parseTag(obj.data);
@@ -613,7 +642,7 @@ export function collectCommitObjects(store: ObjectStore, commitOids: ReadonlySet
         const target = store.get(tag.object);
         if (target) {
           out.set(tag.object, target);
-          visitTree(parseCommit(target.data).tree);
+          visitTree(parseCommitLight(target.data).tree);
         }
       } else if (tag.type === 'tree') visitTree(tag.object);
       else {
@@ -630,13 +659,14 @@ export function isAncestor(store: ObjectStore, ancestor: string, descendant: str
   if (ancestor === descendant) return true;
   const seen = new Set<string>();
   const queue: string[] = [descendant];
-  while (queue.length > 0) {
-    const oid = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++]!;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = store.get(oid);
     if (!obj || obj.type !== 'commit') continue;
-    for (const p of parseCommit(obj.data).parents) {
+    for (const p of parseCommitLight(obj.data).parents) {
       if (p === ancestor) return true;
       if (!seen.has(p)) queue.push(p);
     }
@@ -648,25 +678,27 @@ export function isAncestor(store: ObjectStore, ancestor: string, descendant: str
 export function mergeBase(store: ObjectStore, a: string, b: string): string | null {
   const ancestorsA = new Set<string>();
   const queueA: string[] = [a];
-  while (queueA.length > 0) {
-    const oid = queueA.shift()!;
+  let headA = 0;
+  while (headA < queueA.length) {
+    const oid = queueA[headA++]!;
     if (ancestorsA.has(oid)) continue;
     ancestorsA.add(oid);
     const obj = store.get(oid);
     if (!obj || obj.type !== 'commit') continue;
-    for (const p of parseCommit(obj.data).parents) queueA.push(p);
+    for (const p of parseCommitLight(obj.data).parents) queueA.push(p);
   }
   // BFS from b: first commit also in A is the merge base.
   const seen = new Set<string>();
   const queueB: string[] = [b];
-  while (queueB.length > 0) {
-    const oid = queueB.shift()!;
+  let headB = 0;
+  while (headB < queueB.length) {
+    const oid = queueB[headB++]!;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (ancestorsA.has(oid)) return oid;
     const obj = store.get(oid);
     if (!obj || obj.type !== 'commit') continue;
-    for (const p of parseCommit(obj.data).parents) queueB.push(p);
+    for (const p of parseCommitLight(obj.data).parents) queueB.push(p);
   }
   return null;
 }

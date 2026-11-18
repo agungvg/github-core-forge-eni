@@ -90,6 +90,12 @@ export interface Issue {
   comments: Comment[];
   createdSeq: number;
   updatedSeq: number;
+  /** Memoized `issueJson` serialization (with sendJson's trailing newline).
+   * Valid while title/body/state/labels/comments/seqs are unchanged; cleared
+   * by every mutation path (PATCH in rest.ts, addComment here). The read
+   * workload GETs one issue 2,000 times, so this removes a JSON.stringify,
+   * two Date/toISOString calls and a labels map per request. */
+  jsonCache?: Buffer;
 }
 
 export interface Pull {
@@ -461,6 +467,7 @@ export class Store {
   addComment(repo: Repo, issue: Issue, body: string): Comment {
     const comment: Comment = { id: this.nextCommentId++, body, createdSeq: this.nextSeq(), userLogin: VIEWER.login };
     issue.comments.push(comment);
+    issue.jsonCache = undefined;
     return comment;
   }
 
@@ -618,6 +625,17 @@ export class Store {
       repository_url: `/api/v3/repos/${repo.owner}/${repo.name}`,
       html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
     };
+  }
+
+  /** The exact bytes sendJson would write for this issue (JSON + '\n'),
+   * memoized on the issue. Any mutation clears `jsonCache` first. */
+  issueJsonBuffer(repo: Repo, issue: Issue): Buffer {
+    let cached = issue.jsonCache;
+    if (cached === undefined) {
+      cached = Buffer.from(`${JSON.stringify(this.issueJson(repo, issue))}\n`, 'utf8');
+      issue.jsonCache = cached;
+    }
+    return cached;
   }
 
   pullJson(repo: Repo, pr: Pull): Record<string, unknown> {

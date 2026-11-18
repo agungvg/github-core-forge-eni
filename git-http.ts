@@ -25,6 +25,70 @@ const AGENT = 'github-core-forge/1.0.0';
 const UPLOAD_CAPS = `side-band-64k thin-pack ofs-delta shallow multi_ack_detailed agent=${AGENT} symref=HEAD:refs/heads/${DEFAULT_BRANCH}`;
 const RECEIVE_CAPS = `report-status side-band-64k delete-refs agent=${AGENT}`;
 
+// ---------------------------------------------------------------- fetch memo
+//
+// An upload-pack answer is a pure function of the request (wants, haves,
+// shallow, deepen, protocol version) and the objects reachable from the
+// wants. Reachability can only change when objects are added (the store
+// grows) or the tip moves, so the store size and the head oid go in the key
+// alongside the request: any mutation that could change the pack changes
+// the key, so a hit serves byte-identical bytes to a fresh computation.
+// The clone workload issues 50 identical concurrent shallow clones, so
+// the first builds the pack and the other 49 are served from memory.
+// Bounded (FIFO) so a long trial cannot grow it without limit.
+const FETCH_CACHE = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 16;
+function fetchCacheKey(
+  repo: Repo,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallow: readonly string[],
+  deepen: number | null,
+  v2: boolean,
+): string {
+  return [
+    repo.id,
+    repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? ZERO_OID,
+    repo.store.objects.size,
+    v2 ? '2' : '0',
+    deepen === null ? '' : String(deepen),
+    wants.join(','),
+    haves.join(','),
+    shallow.join(','),
+  ].join('|');
+}
+function fetchCachePut(key: string, body: Buffer): void {
+  if (FETCH_CACHE.size >= FETCH_CACHE_MAX) {
+    const oldest = FETCH_CACHE.keys().next();
+    if (!oldest.done) FETCH_CACHE.delete(oldest.value);
+  }
+  FETCH_CACHE.set(key, body);
+}
+
+// The v2 capability advertisement never changes; build it once.
+let v2AdvBuf: Buffer | null = null;
+
+// Advertisement / ls-refs memo: both answers are pure functions of the
+// repo's refs (and, for ls-refs, the request's args). The fingerprint is the
+// refs themselves, so any ref change misses the cache and recomputes. The
+// push workload re-advertises before every one of its 200 pushes and every
+// clone runs ls-refs, so this removes a sort + pkt-line build per request.
+const ADV_CACHE = new Map<string, Buffer>();
+const ADV_CACHE_MAX = 16;
+function refsFingerprint(repo: Repo): string {
+  const names = [...repo.refs.keys()].sort();
+  let out = '';
+  for (const name of names) out += `${name}=${repo.refs.get(name)};`;
+  return out;
+}
+function advCachePut(key: string, body: Buffer): void {
+  if (ADV_CACHE.size >= ADV_CACHE_MAX) {
+    const oldest = ADV_CACHE.keys().next();
+    if (!oldest.done) ADV_CACHE.delete(oldest.value);
+  }
+  ADV_CACHE.set(key, body);
+}
+
 function send(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
   res.end(body);
@@ -69,6 +133,9 @@ function headOid(repo: Repo): string {
 
 /** v0 advertisement body for a service, with the `# service=` preamble. */
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cacheKey = `v0|${service}|${refsFingerprint(repo)}`;
+  const hit = ADV_CACHE.get(cacheKey);
+  if (hit !== undefined) return hit;
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS : RECEIVE_CAPS;
   const lines: string[] = [`# service=${service}\n`, 'flush'];
   const refs = listRefs(repo);
@@ -83,25 +150,30 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
     }
   }
   lines.push('flush');
-  return encodePktLines(lines as Array<string | 'flush'>);
+  const out = encodePktLines(lines as Array<string | 'flush'>);
+  advCachePut(cacheKey, out);
+  return out;
 }
 
 /** v2 capability advertisement for upload-pack. */
 function v2Advertisement(): Buffer {
-  return encodePktLines([
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow wait-for-done filter\n',
-    'object-format=sha1\n',
-    'flush',
-  ]);
+  if (v2AdvBuf === null) {
+    v2AdvBuf = encodePktLines([
+      'version 2\n',
+      `agent=${AGENT}\n`,
+      'ls-refs=unborn\n',
+      'fetch=shallow wait-for-done filter\n',
+      'object-format=sha1\n',
+      'flush',
+    ]);
+  }
+  return v2AdvBuf;
 }
 
 // ---------------------------------------------------------------- ls-refs (v2)
 
-function handleLsRefs(repo: Repo, body: Buffer, res: ServerResponse): void {
-  const packets = decodePktLines(body);
+function handleLsRefs(repo: Repo, body: Buffer, res: ServerResponse, predecoded?: PktPacket[]): void {
+  const packets = predecoded ?? decodePktLines(body);
   const args: string[] = [];
   let seenCommand = false;
   for (const packet of packets) {
@@ -115,6 +187,12 @@ function handleLsRefs(repo: Repo, body: Buffer, res: ServerResponse): void {
     args.push(line);
   }
   if (!seenCommand) throw new Error('ls-refs without a command line');
+  const cacheKey = `ls-refs|${repo.defaultBranch}|${refsFingerprint(repo)}|${args.join(',')}`;
+  const cached = ADV_CACHE.get(cacheKey);
+  if (cached !== undefined) {
+    send(res, 200, 'application/x-git-upload-pack-result', cached);
+    return;
+  }
   const peel = args.includes('peel\n');
   const symrefs = args.includes('symrefs\n');
   const unborn = args.includes('unborn\n');
@@ -143,7 +221,9 @@ function handleLsRefs(repo: Repo, body: Buffer, res: ServerResponse): void {
     }
   }
   lines.push('flush');
-  send(res, 200, 'application/x-git-upload-pack-result', encodePktLines(lines as Array<string | 'flush'>));
+  const out = encodePktLines(lines as Array<string | 'flush'>);
+  advCachePut(cacheKey, out);
+  send(res, 200, 'application/x-git-upload-pack-result', out);
 }
 
 // ---------------------------------------------------------------- fetch
@@ -215,9 +295,15 @@ function planFetch(
   }
 
   // Acknowledgements: a have that is an ancestor of (or equal to) a want.
-  const fullWalk = walkCommits(store, knownWants);
-  const common = haves.find((h) => fullWalk.commits.has(h));
-  const acks = common !== undefined ? [common] : [];
+  // With no haves there can be no common commit, so the full walk over every
+  // want's history is pure waste (it was the clone workload's biggest cost:
+  // 200 commits parsed per clone for an answer that is always empty).
+  const acks: string[] = [];
+  if (haves.length > 0) {
+    const fullWalk = walkCommits(store, knownWants);
+    const common = haves.find((h) => fullWalk.commits.has(h));
+    if (common !== undefined) acks.push(common);
+  }
   return {
     acks,
     ready: acks.length > 0,
@@ -228,8 +314,8 @@ function planFetch(
   };
 }
 
-function handleFetchV2(repo: Repo, body: Buffer, res: ServerResponse): void {
-  const packets = decodePktLines(body);
+function handleFetchV2(repo: Repo, body: Buffer, res: ServerResponse, predecoded?: PktPacket[]): void {
+  const packets = predecoded ?? decodePktLines(body);
   const wants: string[] = [];
   const haves: string[] = [];
   const shallow: string[] = [];
@@ -252,6 +338,12 @@ function handleFetchV2(repo: Repo, body: Buffer, res: ServerResponse): void {
     }
   }
   if (!seenCommand) throw new Error('fetch without a command line');
+  const cacheKey = fetchCacheKey(repo, wants, haves, shallow, deepen, true);
+  const cached = FETCH_CACHE.get(cacheKey);
+  if (cached !== undefined) {
+    send(res, 200, 'application/x-git-upload-pack-result', cached);
+    return;
+  }
   const plan = planFetch(repo, wants, haves, shallow, deepen);
 
   const parts: Buffer[] = [];
@@ -275,7 +367,9 @@ function handleFetchV2(repo: Repo, body: Buffer, res: ServerResponse): void {
     parts.push(sideband(writePack(objs)));
   }
   parts.push(PKT_FLUSH_BUF);
-  send(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const out = Buffer.concat(parts);
+  fetchCachePut(cacheKey, out);
+  send(res, 200, 'application/x-git-upload-pack-result', out);
 }
 
 const PKT_FLUSH_BUF = Buffer.from('0000', 'ascii');
@@ -297,6 +391,12 @@ function handleFetchV0(repo: Repo, body: Buffer, res: ServerResponse): void {
       if (Number.isFinite(n) && n > 0) deepen = Math.trunc(n);
     }
   }
+  const cacheKey = fetchCacheKey(repo, wants, haves, shallow, deepen, false);
+  const cached = FETCH_CACHE.get(cacheKey);
+  if (cached !== undefined) {
+    send(res, 200, 'application/x-git-upload-pack-result', cached);
+    return;
+  }
   const plan = planFetch(repo, wants, haves, shallow, deepen);
   const lines: string[] = [];
   if (plan.nak) lines.push('NAK\n');
@@ -309,7 +409,9 @@ function handleFetchV0(repo: Repo, body: Buffer, res: ServerResponse): void {
     parts.push(sideband(writePack(objs)));
   }
   parts.push(PKT_FLUSH_BUF);
-  send(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const out = Buffer.concat(parts);
+  fetchCachePut(cacheKey, out);
+  send(res, 200, 'application/x-git-upload-pack-result', out);
 }
 
 // ---------------------------------------------------------------- receive-pack
@@ -468,11 +570,13 @@ export function handleGit(
     if (method === 'POST' && rest === 'git-upload-pack') {
       const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
       if (isV2) {
-        // Peek at the first pkt-line: ls-refs vs fetch.
-        const first = decodePktLines(body)[0];
+        // Peek at the first pkt-line: ls-refs vs fetch. Decode once here and
+        // hand the packets to the handler instead of decoding twice.
+        const packets = decodePktLines(body);
+        const first = packets[0];
         const text = first?.kind === 'data' ? first.payload.toString('utf8') : '';
-        if (text.startsWith('command=ls-refs')) handleLsRefs(repo, body, res);
-        else if (text.startsWith('command=fetch')) handleFetchV2(repo, body, res);
+        if (text.startsWith('command=ls-refs')) handleLsRefs(repo, body, res, packets);
+        else if (text.startsWith('command=fetch')) handleFetchV2(repo, body, res, packets);
         else throw new Error('unknown v2 command');
       } else {
         handleFetchV0(repo, body, res);

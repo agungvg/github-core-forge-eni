@@ -32,14 +32,30 @@ export function createApp(): Server {
     });
     req.on('end', () => {
       const body = Buffer.concat(chunks);
+      // Fast URL split: `new URL()` per request is one of the hottest costs
+      // on this server (every bench op is an HTTP request). The pathname is
+      // everything before the first '?', the query after it; handlers decode
+      // segments themselves exactly as before. Absolute-form URLs (a proxy
+      // spelling) still go through the URL parser.
+      const rawUrl = req.url ?? '/';
       let pathname = '/';
       let search = new URLSearchParams();
-      try {
-        const url = new URL(req.url ?? '/', 'http://entry');
-        pathname = url.pathname;
-        search = url.searchParams;
-      } catch {
-        pathname = '/';
+      if (rawUrl.startsWith('http://') || rawUrl.startsWith('https://')) {
+        try {
+          const url = new URL(rawUrl);
+          pathname = url.pathname;
+          search = url.searchParams;
+        } catch {
+          pathname = '/';
+        }
+      } else {
+        const q = rawUrl.indexOf('?');
+        if (q < 0) pathname = rawUrl;
+        else {
+          pathname = rawUrl.slice(0, q);
+          search = new URLSearchParams(rawUrl.slice(q + 1));
+        }
+        if (pathname === '') pathname = '/';
       }
       const method = req.method ?? 'GET';
       try {

@@ -533,6 +533,7 @@ function executeMutation(ctx: Ctx, field: GqlField): Record<string, unknown> | n
     }
     issue.state = 'closed';
     issue.updatedSeq = ctx.store.nextSeq();
+    issue.jsonCache = undefined;
     const sel = field.selections?.find((s) => s.name === 'issue')?.selections ?? null;
     return { [key]: { issue: issueValue(ctx, repo, issue.number, sel) } };
   }
