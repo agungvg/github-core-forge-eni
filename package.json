@@ -1,1 +1,1 @@
-{"description":"A GitHub-compatible git forge: the TypeScript entry ported to Go for speed (static binary launched by main.ts)","engines":{"node":">=22.18"},"license":"MIT","name":"github-core-clone-01-go","private":true,"scripts":{"start":"node main.ts"},"type":"module","version":"0.0.0"}
+{"description":"GitHub-compatible git forge: the entry ported to Go for speed","engines":{"node":">=22.18"},"license":"MIT","name":"github-core-clone-01-go","private":true,"scripts":{"start":"node main.ts"},"type":"module","version":"0.0.0"}

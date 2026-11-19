@@ -1,13 +1,19 @@
-// store.go — the forge's whole state, in memory. Ported from store.ts.
-// One Store holds every repository: its git objects and refs, its issues,
-// labels, comments and pull requests. Everything is deterministic: ids and
-// numbers come from counters, timestamps from MAKEFUN_TRIAL_NOW plus a
-// sequence (never the wall clock), so a replayed trial leaves the same
-// state byte-for-byte.
+// store.go — every scrap of forge state, held in memory.
 //
-// One deliberate difference: labels keep an explicit insertion-order list
-// (labelNames), because Go map iteration is random while JS Maps preserve
-// insertion order.
+// A Store is the whole world for this process: repositories with their git
+// objects and refs, plus the collaboration layer on top (issues, labels,
+// comments, pull requests). Nothing here touches disk; the trial lives and
+// dies with the process, which is exactly what the perf workloads want —
+// every read is a map lookup, every write a map store.
+//
+// Determinism is the other half of the design. Ids and numbers come from
+// counters that only ever go up, and every timestamp is the trial epoch
+// plus a monotonic sequence tick — one tick per thing created. No wall
+// clock, no randomness, so replaying a trial rebuilds the same state.
+//
+// Labels need one extra piece of bookkeeping: Go maps iterate in random
+// order, so each repo keeps its label names in insertion order alongside
+// the map.
 
 package main
 
@@ -19,37 +25,53 @@ import (
 	"time"
 )
 
-const viewerLogin = "adaiversen"
-const viewerID = 1000
-const viewerName = "ada iversen"
-const viewerEmail = "adaiversen@example.invalid"
+// The viewer — the single authenticated user this forge knows — and the two
+// other people who show up in seeded data. Constants, not lookups: the
+// scenario seed is fixed and the bearer token is opaque, so the token's
+// owner is known by construction.
+const (
+	viewerLogin = "adaiversen"
+	viewerID    = 1000
+	viewerName  = "ada iversen"
+	viewerEmail = "adaiversen@example.invalid"
 
-const teammateLogin = "quinnkeller"
-const teammateID = 1001
+	teammateLogin = "quinnkeller"
+	teammateID    = 1001
 
-const strangerLogin = "olgabauer"
-const strangerID = 1002
+	strangerLogin = "olgabauer"
+	strangerID    = 1002
+)
 
 const defaultBranch = "main"
-const scenarioEpochSec = 1735689600 // 2025-01-01T00:00:00Z
 
+// 2025-01-01T00:00:00Z, the trial epoch when MAKEFUN_TRIAL_NOW is unset.
+const scenarioEpochSec = 1735689600
+
+// trialEpochSec reads the trial clock's base from the environment. It
+// accepts a plain unix second count, a millisecond count (anything over
+// 1e12), or a date string in one of the common layouts; anything
+// unparseable falls back to the scenario epoch.
 func trialEpochSec() int64 {
 	raw := os.Getenv("MAKEFUN_TRIAL_NOW")
-	if raw != "" {
-		if asNum, ok := jsNumber(raw); ok && !isNaN(asNum) && asNum > 0 {
-			if asNum > 1e12 {
-				return int64(asNum / 1000)
-			}
-			return int64(asNum)
+	if raw == "" {
+		return scenarioEpochSec
+	}
+	if num, ok := jsNumber(raw); ok && !isNaN(num) && num > 0 {
+		if num > 1e12 {
+			return int64(num / 1000)
 		}
-		// Date.parse fallback: try common layouts.
-		for _, layout := range []string{
-			time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.999Z07:00",
-			"2006-01-02 15:04:05", "2006-01-02",
-		} {
-			if t, err := time.Parse(layout, raw); err == nil {
-				return t.Unix()
-			}
+		return int64(num)
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.999Z07:00",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, layout := range layouts {
+		if parsed, err := time.Parse(layout, raw); err == nil {
+			return parsed.Unix()
 		}
 	}
 	return scenarioEpochSec
@@ -57,29 +79,34 @@ func trialEpochSec() int64 {
 
 func isNaN(f float64) bool { return f != f }
 
-// viewerIdentity mirrors viewerIdentity(ts).
+// viewerIdentity builds the git identity for the viewer at a given
+// absolute timestamp.
 func viewerIdentity(ts int64) Identity {
 	return Identity{Name: viewerName, Email: viewerEmail, TS: ts}
 }
 
-// Opaque, deterministic global ids: base64url of a typed tag.
+// globalId mints an opaque id: the base64url encoding of a typed tag and
+// its parts joined with colons, e.g. "R:5000" or "I:5000:3". Clients see
+// only the opaque string; the server can decode it again without a table.
 func globalId(tag string, parts ...any) string {
-	strs := []string{tag}
+	var b strings.Builder
+	b.WriteString(tag)
 	for _, p := range parts {
+		b.WriteByte(':')
 		switch v := p.(type) {
 		case string:
-			strs = append(strs, v)
+			b.WriteString(v)
 		case int:
-			strs = append(strs, strconv.Itoa(v))
+			b.WriteString(strconv.Itoa(v))
 		case int64:
-			strs = append(strs, strconv.FormatInt(v, 10))
+			b.WriteString(strconv.FormatInt(v, 10))
 		case float64:
-			strs = append(strs, jsNumberString(v))
+			b.WriteString(jsNumberString(v))
 		default:
-			strs = append(strs, jsString(v))
+			b.WriteString(jsString(v))
 		}
 	}
-	return base64urlEncode([]byte(strings.Join(strs, ":")))
+	return base64urlEncode([]byte(b.String()))
 }
 
 type decodedGlobalId struct {
@@ -87,16 +114,22 @@ type decodedGlobalId struct {
 	Parts []string
 }
 
+// decodeGlobalId reverses globalId. It returns nil for anything that is
+// not a base64url-encoded string whose tag is a single uppercase letter.
 func decodeGlobalId(id string) *decodedGlobalId {
-	raw := lenientBase64urlDecode(id)
-	text := string(raw)
-	parts := strings.Split(text, ":")
-	tag := parts[0]
-	if tag == "" || len(tag) != 1 || tag[0] < 'A' || tag[0] > 'Z' {
+	text := string(lenientBase64urlDecode(id))
+	fields := strings.Split(text, ":")
+	if len(fields) == 0 {
 		return nil
 	}
-	return &decodedGlobalId{Tag: tag, Parts: parts[1:]}
+	tag := fields[0]
+	if len(tag) != 1 || tag[0] < 'A' || tag[0] > 'Z' {
+		return nil
+	}
+	return &decodedGlobalId{Tag: tag, Parts: fields[1:]}
 }
+
+// ---------------------------------------------------------------- types
 
 type Label struct {
 	Name        string
@@ -121,10 +154,10 @@ type Issue struct {
 	Comments   []*Comment
 	CreatedSeq int64
 	UpdatedSeq int64
-	// Memoized issueJson serialization (with sendJson's trailing newline).
-	// Valid while title/body/state/labels/comments/seqs are unchanged;
-	// cleared by every mutation path. The read workload GETs one issue
-	// 2,000 times, so this removes a JSON encode per request.
+	// Memoized IssueJSONBuffer output (JSON plus the trailing newline
+	// sendJson appends). Stays valid while the issue's visible fields are
+	// unchanged; every mutation path clears it. The read workload fetches
+	// one issue 2,000 times, so this skips a JSON encode per request.
 	jsonCache []byte
 }
 
@@ -172,128 +205,138 @@ type FileChange struct {
 	BaseOid   any // string | nil
 }
 
+// ------------------------------------------------------- content helpers
+
+// lineCounts counts added and removed lines between two blob bodies using
+// a multiset diff: a line present in head but not (still) in base is an
+// addition; a base line with no matching head line is a deletion. A final
+// newline does not create a phantom empty line.
 func lineCounts(base []byte, head []byte) (additions, deletions int) {
-	var baseLines, headLines []string
-	if base != nil {
-		baseLines = strings.Split(string(base), "\n")
+	splitLines := func(data []byte) []string {
+		if data == nil {
+			return nil
+		}
+		lines := strings.Split(string(data), "\n")
+		if n := len(lines); n > 0 && lines[n-1] == "" {
+			lines = lines[:n-1]
+		}
+		return lines
 	}
-	if head != nil {
-		headLines = strings.Split(string(head), "\n")
+	remaining := make(map[string]int)
+	for _, line := range splitLines(base) {
+		remaining[line]++
 	}
-	// Drop the trailing empty element a final newline leaves behind.
-	if len(baseLines) > 0 && baseLines[len(baseLines)-1] == "" {
-		baseLines = baseLines[:len(baseLines)-1]
-	}
-	if len(headLines) > 0 && headLines[len(headLines)-1] == "" {
-		headLines = headLines[:len(headLines)-1]
-	}
-	baseCount := make(map[string]int)
-	for _, l := range baseLines {
-		baseCount[l]++
-	}
-	for _, l := range headLines {
-		if c := baseCount[l]; c > 0 {
-			baseCount[l] = c - 1
+	for _, line := range splitLines(head) {
+		if remaining[line] > 0 {
+			remaining[line]--
 		} else {
 			additions++
 		}
 	}
-	for _, c := range baseCount {
-		deletions += c
+	for _, left := range remaining {
+		deletions += left
 	}
 	return additions, deletions
 }
 
-// Flatten a tree (by oid) into path -> {oid, mode}.
+// flattenTree walks a tree object depth-first and returns every blob it
+// contains as path -> entry. Directories (mode 40000) are descended into,
+// never listed. A missing or malformed tree flattens to nothing.
 func flattenTree(store *ObjectStore, treeOid string, prefix string, out map[string]TreeEntry) map[string]TreeEntry {
 	if out == nil {
 		out = make(map[string]TreeEntry)
 	}
-	obj := store.Get(treeOid)
-	if obj == nil || obj.Type != ObjTree {
-		return out
+	type pending struct {
+		oid    string
+		prefix string
 	}
-	entries, err := parseTree(obj.Data)
-	if err != nil {
-		return out
-	}
-	for _, e := range entries {
-		path := e.Name
-		if prefix != "" {
-			path = prefix + "/" + e.Name
+	stack := []pending{{oid: treeOid, prefix: prefix}}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		obj := store.Get(cur.oid)
+		if obj == nil || obj.Type != ObjTree {
+			continue
 		}
-		if e.Mode == "40000" {
-			flattenTree(store, e.OID, path, out)
-		} else {
-			out[path] = TreeEntry{Mode: e.Mode, Name: e.Name, OID: e.OID}
+		entries, err := parseTree(obj.Data)
+		if err != nil {
+			continue
+		}
+		// Push in reverse so entries come out in tree order.
+		for i := len(entries) - 1; i >= 0; i-- {
+			e := entries[i]
+			path := e.Name
+			if cur.prefix != "" {
+				path = cur.prefix + "/" + e.Name
+			}
+			if e.Mode == "40000" {
+				stack = append(stack, pending{oid: e.OID, prefix: path})
+			} else {
+				out[path] = TreeEntry{Mode: e.Mode, Name: e.Name, OID: e.OID}
+			}
 		}
 	}
 	return out
 }
 
+// diffTrees diffs two trees (by oid; "" means the empty tree) and returns
+// the changed paths in sorted order. A path only in head is "added", only
+// in base is "changed" (deleted), and in both with a different oid is
+// "modified". Unchanged paths never appear.
 func diffTrees(store *ObjectStore, baseTreeOid string, headTreeOid string) []FileChange {
-	var base, head map[string]TreeEntry
-	if baseTreeOid != "" {
-		base = flattenTree(store, baseTreeOid, "", nil)
-	} else {
-		base = make(map[string]TreeEntry)
-	}
-	if headTreeOid != "" {
-		head = flattenTree(store, headTreeOid, "", nil)
-	} else {
-		head = make(map[string]TreeEntry)
-	}
-	pathSet := make(map[string]bool)
+	base := flattenTree(store, baseTreeOid, "", nil)
+	head := flattenTree(store, headTreeOid, "", nil)
+	paths := make([]string, 0, len(base)+len(head))
+	seen := make(map[string]bool, len(base)+len(head))
 	for p := range base {
-		pathSet[p] = true
-	}
-	for p := range head {
-		pathSet[p] = true
-	}
-	paths := make([]string, 0, len(pathSet))
-	for p := range pathSet {
+		seen[p] = true
 		paths = append(paths, p)
 	}
+	for p := range head {
+		if !seen[p] {
+			seen[p] = true
+			paths = append(paths, p)
+		}
+	}
 	sort.Strings(paths)
-	var changes []FileChange
+	changes := make([]FileChange, 0, len(paths))
 	for _, path := range paths {
-		b, hasB := base[path]
-		h, hasH := head[path]
-		if hasB && hasH && b.OID == h.OID {
+		before, hasBefore := base[path]
+		after, hasAfter := head[path]
+		if hasBefore && hasAfter && before.OID == after.OID {
 			continue
 		}
 		var baseData, headData []byte
-		if hasB {
-			if o := store.Get(b.OID); o != nil {
+		if hasBefore {
+			if o := store.Get(before.OID); o != nil {
 				baseData = o.Data
 			}
 		}
-		if hasH {
-			if o := store.Get(h.OID); o != nil {
+		if hasAfter {
+			if o := store.Get(after.OID); o != nil {
 				headData = o.Data
 			}
 		}
-		additions, deletions := lineCounts(baseData, headData)
-		status := "modified"
-		if !hasB {
-			status = "added"
-		} else if !hasH {
-			status = "changed"
+		added, removed := lineCounts(baseData, headData)
+		change := FileChange{Path: path, Additions: added, Deletions: removed}
+		switch {
+		case !hasBefore:
+			change.Status = "added"
+			change.HeadOid = after.OID
+		case !hasAfter:
+			change.Status = "changed"
+			change.BaseOid = before.OID
+		default:
+			change.Status = "modified"
+			change.HeadOid = after.OID
+			change.BaseOid = before.OID
 		}
-		var headOid, baseOid any
-		if hasH {
-			headOid = h.OID
-		}
-		if hasB {
-			baseOid = b.OID
-		}
-		changes = append(changes, FileChange{Path: path, Status: status, Additions: additions, Deletions: deletions, HeadOid: headOid, BaseOid: baseOid})
-	}
-	if changes == nil {
-		changes = []FileChange{}
+		changes = append(changes, change)
 	}
 	return changes
 }
+
+// ------------------------------------------------------------------ store
 
 type Store struct {
 	repos         map[string]*Repo
@@ -316,7 +359,8 @@ func NewStore() *Store {
 	}
 }
 
-// Monotonic sequence; every created thing takes the next one.
+// nextSeq hands out the next monotonic sequence tick. Every created thing
+// takes one, and timestamps are epoch + tick.
 func (s *Store) nextSeq() int64 {
 	s.seq++
 	return s.seq
@@ -326,14 +370,15 @@ func (s *Store) isoAt(seq int64) string {
 	return time.Unix(s.epochSec+seq, 0).UTC().Format("2006-01-02T15:04:05.000Z07:00")
 }
 
-// "Now" as an ISO timestamp, deterministic within a trial.
+// nowIso is "now" for served data: the current sequence tick rendered as
+// an ISO timestamp. Deterministic within a trial.
 func (s *Store) nowIso() string { return s.isoAt(s.seq) }
 
 func (s *Store) identity() Identity {
 	return viewerIdentity(s.epochSec + s.seq)
 }
 
-// ---------------------------------------------------------- repositories
+// --------------------------------------------------------- repositories
 
 func (s *Store) repoKey(owner, name string) string { return owner + "/" + name }
 
@@ -354,7 +399,8 @@ func (s *Store) GetRepoById(id int) *Repo {
 }
 
 func (s *Store) CreateRepo(name string, description string, hasDescription bool, private bool, defaultBranchOpt string, hasDefaultBranch bool) *Repo {
-	if _, exists := s.repos[s.repoKey(viewerLogin, name)]; exists {
+	key := s.repoKey(viewerLogin, name)
+	if _, exists := s.repos[key]; exists {
 		return nil
 	}
 	seq := s.nextSeq()
@@ -362,7 +408,7 @@ func (s *Store) CreateRepo(name string, description string, hasDescription bool,
 		ID:              s.nextRepoID,
 		Name:            name,
 		Owner:           viewerLogin,
-		Description:     "",
+		Description:     description,
 		Private:         private,
 		DefaultBranch:   defaultBranch,
 		Store:           NewObjectStore(),
@@ -375,14 +421,14 @@ func (s *Store) CreateRepo(name string, description string, hasDescription bool,
 		CreatedSeq:      seq,
 		UpdatedSeq:      seq,
 	}
-	s.nextRepoID++
-	if hasDescription {
-		repo.Description = description
+	if !hasDescription {
+		repo.Description = ""
 	}
 	if hasDefaultBranch {
 		repo.DefaultBranch = defaultBranchOpt
 	}
-	s.repos[s.repoKey(viewerLogin, name)] = repo
+	s.nextRepoID++
+	s.repos[key] = repo
 	return repo
 }
 
@@ -399,7 +445,7 @@ func (s *Store) DeleteRepo(owner, name string) bool {
 }
 
 func (s *Store) ListViewerRepos() []*Repo {
-	var out []*Repo
+	out := make([]*Repo, 0, len(s.repos))
 	for _, repo := range s.repos {
 		if repo.Owner == viewerLogin {
 			out = append(out, repo)
@@ -409,7 +455,7 @@ func (s *Store) ListViewerRepos() []*Repo {
 	return out
 }
 
-// ---------------------------------------------------------- git refs
+// --------------------------------------------------------------- git refs
 
 func (s *Store) refName(repo *Repo, branch string) string { return "refs/heads/" + branch }
 
@@ -418,13 +464,13 @@ func (s *Store) refTip(repo *Repo, ref string) (string, bool) {
 	return v, ok
 }
 
-// Resolve a branch name or full ref to its tip commit oid.
+// ResolveBranch turns a branch name or a full ref into its tip commit oid.
 func (s *Store) ResolveBranch(repo *Repo, branchOrRef string) (string, bool) {
-	if strings.HasPrefix(branchOrRef, "refs/") {
-		v, ok := repo.Refs[branchOrRef]
-		return v, ok
+	ref := branchOrRef
+	if !strings.HasPrefix(ref, "refs/") {
+		ref = s.refName(repo, branchOrRef)
 	}
-	v, ok := repo.Refs[s.refName(repo, branchOrRef)]
+	v, ok := repo.Refs[ref]
 	return v, ok
 }
 
@@ -437,7 +483,8 @@ func (s *Store) CreateBranch(repo *Repo, branch, sha string) bool {
 	return true
 }
 
-// Read a file (blob) at a ref; nil when the ref/path does not exist.
+// ReadFileAt returns the blob oid and contents of a path at a ref, or
+// ok=false when the ref or the path does not exist.
 func (s *Store) ReadFileAt(repo *Repo, ref, path string) (oid string, data []byte, ok bool) {
 	tip, found := s.ResolveBranch(repo, ref)
 	if !found {
@@ -448,8 +495,7 @@ func (s *Store) ReadFileAt(repo *Repo, ref, path string) (oid string, data []byt
 		return "", nil, false
 	}
 	tree, _ := parseCommitLight(commit.Data)
-	flat := flattenTree(repo.Store, tree, "", nil)
-	entry, found := flat[path]
+	entry, found := flattenTree(repo.Store, tree, "", nil)[path]
 	if !found {
 		return "", nil, false
 	}
@@ -460,7 +506,8 @@ func (s *Store) ReadFileAt(repo *Repo, ref, path string) (oid string, data []byt
 	return entry.OID, blob.Data, true
 }
 
-// List a directory at a ref: nil when the ref/path does not exist.
+// ListDirAt lists the entries of a directory at a ref. The root is listed
+// when path is empty. Returns nil when the ref or the directory is missing.
 type DirEntry struct {
 	Name string
 	Path string
@@ -479,32 +526,11 @@ func (s *Store) ListDirAt(repo *Repo, ref, path string) []DirEntry {
 	}
 	treeOid, _ := parseCommitLight(commit.Data)
 	if path != "" {
-		// Find the subtree at `path`.
-		var walk func(tree string, parts []string) (string, bool)
-		walk = func(tree string, parts []string) (string, bool) {
-			if len(parts) == 0 {
-				return tree, true
-			}
-			obj := repo.Store.Get(tree)
-			if obj == nil || obj.Type != ObjTree {
-				return "", false
-			}
-			entries, err := parseTree(obj.Data)
-			if err != nil {
-				return "", false
-			}
-			for _, e := range entries {
-				if e.Name == parts[0] && e.Mode == "40000" {
-					return walk(e.OID, parts[1:])
-				}
-			}
-			return "", false
-		}
-		foundOid, ok := walk(treeOid, strings.Split(path, "/"))
+		sub, ok := s.subtreeAt(repo, treeOid, strings.Split(path, "/"))
 		if !ok {
 			return nil
 		}
-		treeOid = foundOid
+		treeOid = sub
 	}
 	obj := repo.Store.Get(treeOid)
 	if obj == nil || obj.Type != ObjTree {
@@ -516,20 +542,51 @@ func (s *Store) ListDirAt(repo *Repo, ref, path string) []DirEntry {
 	}
 	out := make([]DirEntry, 0, len(entries))
 	for _, e := range entries {
-		p := e.Name
+		full := e.Name
 		if path != "" {
-			p = path + "/" + e.Name
+			full = path + "/" + e.Name
 		}
-		typ := "file"
+		kind := "file"
 		if e.Mode == "40000" {
-			typ = "dir"
+			kind = "dir"
 		}
-		out = append(out, DirEntry{Name: e.Name, Path: p, OID: e.OID, Type: typ})
+		out = append(out, DirEntry{Name: e.Name, Path: full, OID: e.OID, Type: kind})
 	}
 	return out
 }
 
-// Set (or delete, when content is nil) one path in a tree; returns the new tree oid.
+// subtreeAt descends from a tree oid through path parts and returns the
+// oid of the directory at the end, or false if any part is missing or is
+// not a directory.
+func (s *Store) subtreeAt(repo *Repo, treeOid string, parts []string) (string, bool) {
+	current := treeOid
+	for _, part := range parts {
+		obj := repo.Store.Get(current)
+		if obj == nil || obj.Type != ObjTree {
+			return "", false
+		}
+		entries, err := parseTree(obj.Data)
+		if err != nil {
+			return "", false
+		}
+		next := ""
+		for _, e := range entries {
+			if e.Name == part && e.Mode == "40000" {
+				next = e.OID
+				break
+			}
+		}
+		if next == "" {
+			return "", false
+		}
+		current = next
+	}
+	return current, true
+}
+
+// setPathInTree writes (content != nil) or deletes (content == nil) one
+// path in a tree, creating intermediate directories as needed, and returns
+// the oid of the new tree. A directory left empty by a delete is pruned.
 func (s *Store) setPathInTree(store *ObjectStore, treeOid string, hasTree bool, parts []string, content []byte) string {
 	var entries []TreeEntry
 	if hasTree {
@@ -537,8 +594,7 @@ func (s *Store) setPathInTree(store *ObjectStore, treeOid string, hasTree bool, 
 			entries, _ = parseTree(obj.Data)
 		}
 	}
-	head := parts[0]
-	rest := parts[1:]
+	head, rest := parts[0], parts[1:]
 	idx := -1
 	for i, e := range entries {
 		if e.Name == head {
@@ -546,43 +602,41 @@ func (s *Store) setPathInTree(store *ObjectStore, treeOid string, hasTree bool, 
 			break
 		}
 	}
+	replaceOrAppend := func(entry TreeEntry) {
+		if idx >= 0 {
+			entries[idx] = entry
+		} else {
+			entries = append(entries, entry)
+		}
+	}
+	removeAt := func() {
+		if idx >= 0 {
+			entries = append(entries[:idx], entries[idx+1:]...)
+		}
+	}
 	if len(rest) == 0 {
 		if content == nil {
-			if idx >= 0 {
-				entries = append(entries[:idx], entries[idx+1:]...)
-			}
+			removeAt()
 		} else {
-			blobOid := store.Put(ObjBlob, content)
-			if idx >= 0 {
-				entries[idx] = TreeEntry{Mode: "100644", Name: head, OID: blobOid}
-			} else {
-				entries = append(entries, TreeEntry{Mode: "100644", Name: head, OID: blobOid})
-			}
+			replaceOrAppend(TreeEntry{Mode: "100644", Name: head, OID: store.Put(ObjBlob, content)})
 		}
-	} else {
-		var childTree string
-		hasChild := false
-		if idx >= 0 && entries[idx].Mode == "40000" {
-			childTree = entries[idx].OID
-			hasChild = true
-		}
-		newChild := s.setPathInTree(store, childTree, hasChild, rest, content)
-		// An emptied subtree disappears; a fresh one appears.
-		childObj := store.Get(newChild)
-		childEmpty := false
-		if childObj != nil && childObj.Type == ObjTree {
-			childEntries, _ := parseTree(childObj.Data)
-			childEmpty = len(childEntries) == 0
-		}
-		if childEmpty {
-			if idx >= 0 {
-				entries = append(entries[:idx], entries[idx+1:]...)
-			}
-		} else if idx >= 0 {
-			entries[idx] = TreeEntry{Mode: "40000", Name: head, OID: newChild}
-		} else {
-			entries = append(entries, TreeEntry{Mode: "40000", Name: head, OID: newChild})
-		}
+		return store.Put(ObjTree, buildTree(entries))
+	}
+	childOid, hasChild := "", false
+	if idx >= 0 && entries[idx].Mode == "40000" {
+		childOid, hasChild = entries[idx].OID, true
+	}
+	newChild := s.setPathInTree(store, childOid, hasChild, rest, content)
+	empty := false
+	if child := store.Get(newChild); child != nil && child.Type == ObjTree {
+		kids, _ := parseTree(child.Data)
+		empty = len(kids) == 0
+	}
+	switch {
+	case empty:
+		removeAt()
+	default:
+		replaceOrAppend(TreeEntry{Mode: "40000", Name: head, OID: newChild})
 	}
 	return store.Put(ObjTree, buildTree(entries))
 }
@@ -593,9 +647,11 @@ type CommitFileResult struct {
 	Created   bool
 }
 
-// Commit a file change on `branch` (creating the branch from the default tip
-// when it does not exist, creating the root commit when the repo is unborn).
-// Returns nil when the branch base does not exist.
+// CommitFile commits one file change on a branch. A branch that does not
+// exist yet starts from the default branch tip; the default branch itself
+// starts from nothing (the root commit). Returns nil when there is no base
+// to build on, or the path is empty. Created is true only for the repo's
+// very first commit.
 func (s *Store) CommitFile(repo *Repo, branch, path string, content []byte, message string) *CommitFileResult {
 	ref := s.refName(repo, branch)
 	tip, hasTip := repo.Refs[ref]
@@ -611,7 +667,6 @@ func (s *Store) CommitFile(repo *Repo, branch, path string, content []byte, mess
 		hasBaseTree = true
 		parents = append(parents, tip)
 	} else if branch != repo.DefaultBranch {
-		// New branch starts from the default branch tip.
 		defaultTip, ok := repo.Refs[s.refName(repo, repo.DefaultBranch)]
 		if !ok {
 			return nil
@@ -624,7 +679,7 @@ func (s *Store) CommitFile(repo *Repo, branch, path string, content []byte, mess
 		hasBaseTree = true
 		parents = append(parents, defaultTip)
 	}
-	var parts []string
+	parts := make([]string, 0, 4)
 	for _, p := range strings.Split(path, "/") {
 		if p != "" {
 			parts = append(parts, p)
@@ -650,19 +705,19 @@ type CommitListEntry struct {
 	Message string
 }
 
-// Commits reachable from a ref, newest first (first-parent walk, linear histories).
+// ListCommits walks the commits reachable from a ref, newest first. The
+// walk is breadth-first over parents, which matches first-parent order on
+// the linear histories this forge produces.
 func (s *Store) ListCommits(repo *Repo, branchOrRef string) []CommitListEntry {
 	tip, found := s.ResolveBranch(repo, branchOrRef)
 	if !found {
 		return []CommitListEntry{}
 	}
-	var out []CommitListEntry
+	out := []CommitListEntry{}
 	seen := make(map[string]bool)
 	queue := []string{tip}
-	head := 0
-	for head < len(queue) {
+	for head := 0; head < len(queue); head++ {
 		oid := queue[head]
-		head++
 		if seen[oid] {
 			continue
 		}
@@ -675,13 +730,10 @@ func (s *Store) ListCommits(repo *Repo, branchOrRef string) []CommitListEntry {
 		out = append(out, CommitListEntry{Sha: oid, Message: info.Message})
 		queue = append(queue, info.Parents...)
 	}
-	if out == nil {
-		out = []CommitListEntry{}
-	}
 	return out
 }
 
-// ---------------------------------------------------------- issues / labels
+// ------------------------------------------------- issues / labels / comments
 
 func (s *Store) CreateIssue(repo *Repo, title, body string, labels []string) *Issue {
 	seq := s.nextSeq()
@@ -729,7 +781,7 @@ func (s *Store) AddComment(repo *Repo, issue *Issue, body string) *Comment {
 	return comment
 }
 
-// ---------------------------------------------------------- pull requests
+// ------------------------------------------------------------- pull requests
 
 func (s *Store) CreatePull(repo *Repo, title, body, headRef, baseRef string) *Pull {
 	headSha, okH := s.ResolveBranch(repo, headRef)
@@ -761,65 +813,62 @@ func (s *Store) GetPull(repo *Repo, number int) *Pull {
 	return nil
 }
 
-// Files changed between the merge-base tree and the head tree.
-func (s *Store) PullFiles(repo *Repo, pr *Pull) []FileChange {
-	base := mergeBase(repo.Store, pr.HeadSha, pr.BaseSha)
-	var baseTree string
-	if base != "" {
-		if obj := repo.Store.Get(base); obj != nil {
-			baseTree, _ = parseCommitLight(obj.Data)
-		}
+// treeOf resolves a commit oid to its root tree oid, or "" when the commit
+// is missing.
+func treeOf(store *ObjectStore, commitOid string) string {
+	if obj := store.Get(commitOid); obj != nil {
+		tree, _ := parseCommitLight(obj.Data)
+		return tree
 	}
-	var headTree string
-	if obj := repo.Store.Get(pr.HeadSha); obj != nil {
-		headTree, _ = parseCommitLight(obj.Data)
-	}
-	return diffTrees(repo.Store, baseTree, headTree)
+	return ""
 }
 
-// Would a squash merge of this PR conflict? (Three-way, merge-base vs head vs base tip.)
-func (s *Store) MergeConflicts(repo *Repo, pr *Pull) bool {
+// threeWayTrees flattens the three trees a squash merge reasons about:
+// the merge-base tree, the head tree, and the current base-tip tree.
+func (s *Store) threeWayTrees(repo *Repo, pr *Pull) (base, head, tip map[string]TreeEntry) {
 	baseTipSha, ok := s.ResolveBranch(repo, pr.BaseRef)
 	if !ok {
+		return nil, nil, nil
+	}
+	mergeBaseOid := mergeBase(repo.Store, pr.HeadSha, baseTipSha)
+	base = flattenTree(repo.Store, treeOf(repo.Store, mergeBaseOid), "", nil)
+	head = flattenTree(repo.Store, treeOf(repo.Store, pr.HeadSha), "", nil)
+	tip = flattenTree(repo.Store, treeOf(repo.Store, baseTipSha), "", nil)
+	return base, head, tip
+}
+
+// PullFiles lists the files changed between the merge-base tree and the
+// head tree — the PR's diff.
+func (s *Store) PullFiles(repo *Repo, pr *Pull) []FileChange {
+	base := mergeBase(repo.Store, pr.HeadSha, pr.BaseSha)
+	return diffTrees(repo.Store, treeOf(repo.Store, base), treeOf(repo.Store, pr.HeadSha))
+}
+
+// MergeConflicts answers whether a squash merge of this PR would collide:
+// a path the head changed (or deleted) relative to the merge base that the
+// base tip also changed differently. Returns true when the base ref cannot
+// even be resolved.
+func (s *Store) MergeConflicts(repo *Repo, pr *Pull) bool {
+	base, head, tip := s.threeWayTrees(repo, pr)
+	if base == nil {
 		return true
 	}
-	base := mergeBase(repo.Store, pr.HeadSha, baseTipSha)
-	var baseTreeOid string
-	if base != "" {
-		if obj := repo.Store.Get(base); obj != nil {
-			baseTreeOid, _ = parseCommitLight(obj.Data)
-		}
-	}
-	var headTreeOid, tipTreeOid string
-	if obj := repo.Store.Get(pr.HeadSha); obj != nil {
-		headTreeOid, _ = parseCommitLight(obj.Data)
-	}
-	if obj := repo.Store.Get(baseTipSha); obj != nil {
-		tipTreeOid, _ = parseCommitLight(obj.Data)
-	}
-	baseFlat := make(map[string]TreeEntry)
-	if baseTreeOid != "" {
-		baseFlat = flattenTree(repo.Store, baseTreeOid, "", nil)
-	}
-	headFlat := flattenTree(repo.Store, headTreeOid, "", nil)
-	tipFlat := flattenTree(repo.Store, tipTreeOid, "", nil)
-	for path, h := range headFlat {
-		b, hasB := baseFlat[path]
+	for path, h := range head {
+		b, hasB := base[path]
 		if hasB && b.OID == h.OID {
-			continue // unchanged from base
+			continue // head left this path alone
 		}
-		t, hasT := tipFlat[path]
-		if hasT && (!hasB || t.OID != b.OID) && t.OID != h.OID {
-			return true // both sides changed it
+		if t, hasT := tip[path]; hasT && (!hasB || t.OID != b.OID) && t.OID != h.OID {
+			return true
 		}
 	}
-	for path, b := range baseFlat {
-		if _, hasH := headFlat[path]; hasH {
-			continue // deleted on head
+	for path, b := range base {
+		if _, hasH := head[path]; hasH {
+			continue
 		}
-		t, hasT := tipFlat[path]
-		if hasT && t.OID != b.OID {
-			return true // deleted on head, changed on base
+		// Deleted on head; a conflict only if the base tip changed it too.
+		if t, hasT := tip[path]; hasT && t.OID != b.OID {
+			return true
 		}
 	}
 	return false
@@ -830,8 +879,10 @@ type MergeResult struct {
 	Message string
 }
 
-// Squash-merge a PR onto its base branch. Returns nil when the PR cannot
-// merge (conflict or missing refs).
+// MergePull squash-merges an open PR onto its base branch: the merge-base
+// to head diff is applied onto the base tip tree, one commit is written,
+// and the PR is closed as merged. Returns nil for a closed PR, a
+// conflicting merge, or unresolvable refs.
 func (s *Store) MergePull(repo *Repo, pr *Pull) *MergeResult {
 	if pr.State != "open" {
 		return nil
@@ -843,50 +894,29 @@ func (s *Store) MergePull(repo *Repo, pr *Pull) *MergeResult {
 	if !ok {
 		return nil
 	}
-	base := mergeBase(repo.Store, pr.HeadSha, baseTipSha)
-	var baseTreeOid string
-	if base != "" {
-		if obj := repo.Store.Get(base); obj != nil {
-			baseTreeOid, _ = parseCommitLight(obj.Data)
+	base, head, _ := s.threeWayTrees(repo, pr)
+	// Every path the head touched relative to the merge base, in sorted
+	// order so the rebuild is deterministic.
+	touched := make(map[string]bool)
+	for path, h := range head {
+		if b, hasB := base[path]; !hasB || b.OID != h.OID {
+			touched[path] = true
 		}
 	}
-	var headTreeOid, tipTreeOid string
-	if obj := repo.Store.Get(pr.HeadSha); obj != nil {
-		headTreeOid, _ = parseCommitLight(obj.Data)
-	}
-	if obj := repo.Store.Get(baseTipSha); obj != nil {
-		tipTreeOid, _ = parseCommitLight(obj.Data)
-	}
-	baseFlat := make(map[string]TreeEntry)
-	if baseTreeOid != "" {
-		baseFlat = flattenTree(repo.Store, baseTreeOid, "", nil)
-	}
-	headFlat := flattenTree(repo.Store, headTreeOid, "", nil)
-	// Start from the base tip tree; apply every head-side change.
-	newTreeOid := tipTreeOid
-	changed := make(map[string]bool)
-	for path, h := range headFlat {
-		b, hasB := baseFlat[path]
-		if hasB && b.OID == h.OID {
-			continue
-		}
-		changed[path] = true
-	}
-	for path := range baseFlat {
-		if _, hasH := headFlat[path]; !hasH {
-			changed[path] = true // deleted on head
+	for path := range base {
+		if _, hasH := head[path]; !hasH {
+			touched[path] = true
 		}
 	}
-	// Apply changes path by path, rebuilding trees bottom-up.
-	sortedChanged := make([]string, 0, len(changed))
-	for p := range changed {
-		sortedChanged = append(sortedChanged, p)
+	ordered := make([]string, 0, len(touched))
+	for p := range touched {
+		ordered = append(ordered, p)
 	}
-	sort.Strings(sortedChanged)
-	for _, path := range sortedChanged {
-		h, hasH := headFlat[path]
+	sort.Strings(ordered)
+	newTreeOid := treeOf(repo.Store, baseTipSha)
+	for _, path := range ordered {
 		var content []byte
-		if hasH {
+		if h, hasH := head[path]; hasH {
 			if o := repo.Store.Get(h.OID); o != nil {
 				content = o.Data
 			}
@@ -909,7 +939,7 @@ func (s *Store) MergePull(repo *Repo, pr *Pull) *MergeResult {
 	return &MergeResult{Sha: sha, Message: message}
 }
 
-// ---------------------------------------------------------- JSON shapes
+// -------------------------------------------------------------- JSON shapes
 
 func (s *Store) RepoJSON(repo *Repo) map[string]any {
 	openCount := 0
@@ -939,12 +969,9 @@ func (s *Store) RepoJSON(repo *Repo) map[string]any {
 func (s *Store) IssueJSON(repo *Repo, issue *Issue) map[string]any {
 	labels := make([]any, 0, len(issue.Labels))
 	for _, name := range issue.Labels {
-		label := repo.Labels[name]
-		color := "ededed"
-		desc := ""
-		if label != nil {
-			color = label.Color
-			desc = label.Description
+		color, desc := "ededed", ""
+		if label := repo.Labels[name]; label != nil {
+			color, desc = label.Color, label.Description
 		}
 		labels = append(labels, map[string]any{"name": name, "color": color, "description": desc})
 	}
@@ -965,13 +992,12 @@ func (s *Store) IssueJSON(repo *Repo, issue *Issue) map[string]any {
 	}
 }
 
-// The exact bytes sendJson would write for this issue (JSON + '\n'),
-// memoized on the issue. Any mutation clears `jsonCache` first.
+// IssueJSONBuffer returns the exact bytes sendJson would write for this
+// issue (JSON plus '\n'), memoized on the issue. Any mutation clears the
+// cache first.
 func (s *Store) IssueJSONBuffer(repo *Repo, issue *Issue) []byte {
 	if issue.jsonCache == nil {
-		b := marshalJSON(s.IssueJSON(repo, issue))
-		b = append(b, '\n')
-		issue.jsonCache = b
+		issue.jsonCache = append(marshalJSON(s.IssueJSON(repo, issue)), '\n')
 	}
 	return issue.jsonCache
 }

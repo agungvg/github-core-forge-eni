@@ -1,34 +1,36 @@
-// Launcher for the Go forge binary.
+// Node entrypoint for the Go forge.
 //
-// The trial pod mounts /bot read-only (and may mount it noexec), and the
-// committed binary may not carry the exec bit, so the binary is copied to
-// a fresh tmp dir, chmod'ed executable, and run from there. All stdio and
-// env are inherited; the exit code / signal propagates. If the tmp copy
-// cannot run (e.g. tmp is noexec), fall back to the committed binary
-// directly. The Go binary itself does the whole env handshake
-// ($MAKEFUN_ENV_URL/register, /healthz, long-poll /done).
+// The trial pod can mount /bot read-only, and it can mount it noexec too;
+// the committed forge-go binary may also arrive without its execute bit.
+// So this launcher stages the binary into a fresh temporary directory,
+// marks the copy executable, and runs it there. Stdio and the environment
+// are inherited untouched, and the child's exit code — or its signal — is
+// passed straight back to the harness. If the staged copy refuses to
+// start (a noexec /tmp is the usual cause), the launcher retries against
+// the committed binary directly. Everything after that — the register
+// POST, /healthz, the long poll on /done — belongs to the Go binary.
 import { spawn } from 'node:child_process';
-import { copyFileSync, chmodSync, mkdtempSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+const root = path.dirname(fileURLToPath(import.meta.url));
+const shipped = path.join(root, 'forge-go');
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const committed = path.join(here, 'forge-go');
+let settled = false;
 
-let done = false;
 function finish(code: number | null, signal: NodeJS.Signals | null): void {
-  if (done) return;
-  done = true;
-  if (signal) process.kill(process.pid, signal);
+  if (settled) return;
+  settled = true;
+  if (signal !== null) process.kill(process.pid, signal);
   else process.exit(code ?? 1);
 }
 
-function run(binPath: string, fallback: (() => void) | null): void {
-  const child = spawn(binPath, [], { stdio: 'inherit', env: process.env });
+function start(binary: string, onDenied: (() => void) | null): void {
+  const child = spawn(binary, [], { stdio: 'inherit', env: process.env });
   child.on('error', (err: NodeJS.ErrnoException) => {
-    if (fallback && (err.code === 'EACCES' || err.code === 'EPERM')) {
-      fallback();
+    if (onDenied !== null && (err.code === 'EACCES' || err.code === 'EPERM')) {
+      onDenied();
       return;
     }
     console.error('forge launch failed:', err.message);
@@ -37,24 +39,22 @@ function run(binPath: string, fallback: (() => void) | null): void {
   child.on('exit', (code, signal) => finish(code, signal));
 }
 
-let staged: string | null = null;
-try {
-  const dir = mkdtempSync(path.join(tmpdir(), 'forge-'));
-  const dst = path.join(dir, 'forge-go');
-  copyFileSync(committed, dst);
-  chmodSync(dst, 0o755);
-  staged = dst;
-} catch {
-  staged = null;
+function stage(): string | null {
+  try {
+    const dir = mkdtempSync(path.join(tmpdir(), 'forge-'));
+    const copy = path.join(dir, 'forge-go');
+    copyFileSync(shipped, copy);
+    chmodSync(copy, 0o755);
+    return copy;
+  } catch {
+    return null;
+  }
 }
 
-if (staged) {
-  run(staged, () => run(committed, null));
+const staged = stage();
+if (staged !== null) {
+  start(staged, () => start(shipped, null));
 } else {
-  try {
-    chmodSync(committed, 0o755);
-  } catch {
-    // read-only /bot: chmod is best-effort only.
-  }
-  run(committed, null);
+  try { chmodSync(shipped, 0o755); } catch { /* /bot may be read-only */ }
+  start(shipped, null);
 }

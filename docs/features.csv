@@ -1,46 +1,46 @@
 feature,surface,priority,status,checks
-boot/register/healthz,lifecycle,P0,done,env boot: listen(0) register poll done; GET /healthz 200 {"ok":true}
+boot, register and healthz,lifecycle,P0,done,env boot: listen(0), register, poll done; GET /healthz 200 {"ok":true}
 git v2 advertisement,git,P0,done,advertise-v2; advertise-headers
-git v0 advertisement upload-pack,git,P0,done,advertise-v2 (v0 fallback); advertise-headers
-git v0 advertisement receive-pack,git,P0,done,advertise-receive-pack
-git unknown repo 404,git,P0,done,unknown-repo-404
-git v2 ls-refs (+peel/symrefs/unborn/prefix),git,P0,done,ls-refs; ls-refs-prefix
-git clone empty repo,git,P0,done,clone-empty
-git push first commit,git,P0,done,push-first-commit
-git clone object hashes/bytes,git,P0,done,clone-object-hashes; clone-blob-bytes; clone-tree-entries; clone-commit-bytes
-git clone annotated tag,git,P0,done,clone-annotated-tag
-git fetch incremental,git,P0,done,fetch-incremental
-git fetch nothing new,git,P0,done,fetch-nothing-new
-git fetch shallow depth1/deepen/new-tip,git,P0,done,fetch-shallow-depth1; fetch-shallow-deepen; fetch-shallow-new-tip
-git push update/create/delete branch,git,P0,done,push-update-ref; push-create-branch; push-delete-branch
-git push non-fast-forward + mixed report,git,P0,done,push-non-fast-forward; push-mixed-report
+git v0 advertisement for upload-pack,git,P0,done,advertise-v2 (v0 fallback); advertise-headers
+git v0 advertisement for receive-pack,git,P0,done,advertise-receive-pack
+git unknown repo returns 404,git,P0,done,unknown-repo-404
+git v2 ls-refs with peel, symrefs, unborn and prefix,git,P0,done,ls-refs; ls-refs-prefix
+git clone of an empty repo,git,P0,done,clone-empty
+git push of the first commit,git,P0,done,push-first-commit
+git clone object hashes and bytes,git,P0,done,clone-object-hashes; clone-blob-bytes; clone-tree-entries; clone-commit-bytes
+git clone of an annotated tag,git,P0,done,clone-annotated-tag
+git incremental fetch,git,P0,done,fetch-incremental
+git fetch with nothing new,git,P0,done,fetch-nothing-new
+git shallow fetch depth 1, deepen and new tip,git,P0,done,fetch-shallow-depth1; fetch-shallow-deepen; fetch-shallow-new-tip
+git push update, create and delete branch,git,P0,done,push-update-ref; push-create-branch; push-delete-branch
+git push non-fast-forward and mixed report,git,P0,done,push-non-fast-forward; push-mixed-report
 git push delete tag,git,P0,done,push-delete-tag
-git push 100 files,git,P0,done,push-100-files
-git pack integrity + deltas (0 deltas ok),git,P0,done,pack-integrity; pack-deltas
-git sideband framing + push report,git,P0,done,sideband-framing; push-sideband-report
-git repo survives malformed POST,git,P0,done,repo-survives-errors
-rest root + meta + request-id + json,rest,P0,done,root; meta; content-type-json; request-id; error-message; unknown-route-json-404; malformed-body-400
-rest auth 401 + foreign owner 404,rest,P0,done,unauthorized; foreign-token
-rest repo create/list/pagination,rest,P0,done,create; pagination; not-found; patch; delete
-rest branches/commits/refs,rest,P0,done,branches; commits
-rest contents create/update/delete/dir/stale-sha,rest,P0,done,contents-create; contents-directory; contents-stale-sha; contents-delete
-rest labels + issue create (bad label 422),rest,P0,done,create-labels; create; create-title-body; bad-label
-rest issue numbers/list/sort/shape/get/patch/comments,rest,P0,done,numbers-increment; list-open; list-open-excludes-closed; list-sort-asc; list-sort-desc; list-shape; get-one; patch-close; patch-close-persists; comment-create; comments-list
-rest pull create/get/files/list,rest,P0,done,create; create-body; create-head-sha; create-base-sha; get-one; files-list; files-shape; files-multiple; list-state-all; list-default-open; list-shape; get-unknown
-rest pull merge squash + conflict + unknown,rest,P0,done,merge-status; merge-body; merge-closes; merge-commit-on-default; merge-content-on-default; merge-commit-sha; merge-unknown; merge-conflict
-graphql viewer + repository fields,graphql,P0,done,viewer-login; repository-fields
-graphql introspection Issue/PullRequest/Repository/SearchType,graphql,P0,done,introspection-issue; introspection-types
-graphql issues open order + by number + pagination,graphql,P0,done,issues-open-order; issue-by-number; issues-pagination
-graphql create/close issue + add comment,graphql,P0,done,create-issue; close-issue; add-comment
-graphql pull requests list/files/create/merge,graphql,P0,done,pull-requests-list; pull-request-files; create-pull-request; merge-pull-request
-graphql invalid field / unauthenticated / node / unknown repo / batch / global ids,graphql,P0,done,invalid-field; unauthenticated; node-repository; unknown-repository; batched-operations; global-id-stability
-mcp discover + initialize + tools/list, mcp,P0,done,server-discover; initialize; tools-list; tool-schemas; tools-list-idempotent
-mcp create/list issue + create/merge PR + rest parity,mcp,P0,done,create-issue; list-issues; create-pull-request; merge-pull-request; rest-parity
-mcp unknown tool / parse error / missing args / concurrent / auth,mcp,P0,done,unknown-tool; parse-error; missing-arguments; concurrent-calls; auth-required
-perf push 200x1KiB (T_ref 1640.82ms),perf,P1,done,bench push
-perf clone 50x shallow depth1 200-commit (266.941ms),perf,P1,done,bench clone
-perf read 2000 GET issue keep-alive (2759.715ms),perf,P1,done,bench read
-perf write 200 issue creates (348.965ms),perf,P1,done,bench write
+git push of 100 files,git,P0,done,push-100-files
+git pack integrity and deltas (0 deltas is fine),git,P0,done,pack-integrity; pack-deltas
+git side-band framing and push report,git,P0,done,sideband-framing; push-sideband-report
+git repo survives a malformed POST,git,P0,done,repo-survives-errors
+rest root, meta, request id and JSON replies,rest,P0,done,root; meta; content-type-json; request-id; error-message; unknown-route-json-404; malformed-body-400
+rest auth 401 and foreign owner 404,rest,P0,done,unauthorized; foreign-token
+rest repo create, list and pagination,rest,P0,done,create; pagination; not-found; patch; delete
+rest branches, commits and refs,rest,P0,done,branches; commits
+rest contents create, update, delete, directory and stale sha,rest,P0,done,contents-create; contents-directory; contents-stale-sha; contents-delete
+rest labels and issue create with bad label 422,rest,P0,done,create-labels; create; create-title-body; bad-label
+rest issue numbers, list, sort, shape, get, patch and comments,rest,P0,done,numbers-increment; list-open; list-open-excludes-closed; list-sort-asc; list-sort-desc; list-shape; get-one; patch-close; patch-close-persists; comment-create; comments-list
+rest pull create, get, files and list,rest,P0,done,create; create-body; create-head-sha; create-base-sha; get-one; files-list; files-shape; files-multiple; list-state-all; list-default-open; list-shape; get-unknown
+rest pull squash merge, conflict and unknown,rest,P0,done,merge-status; merge-body; merge-closes; merge-commit-on-default; merge-content-on-default; merge-commit-sha; merge-unknown; merge-conflict
+graphql viewer and repository fields,graphql,P0,done,viewer-login; repository-fields
+graphql introspection for Issue, PullRequest, Repository and SearchType,graphql,P0,done,introspection-issue; introspection-types
+graphql open issues order, by number and pagination,graphql,P0,done,issues-open-order; issue-by-number; issues-pagination
+graphql create and close issue plus add comment,graphql,P0,done,create-issue; close-issue; add-comment
+graphql pull requests list, files, create and merge,graphql,P0,done,pull-requests-list; pull-request-files; create-pull-request; merge-pull-request
+graphql invalid field, unauthenticated, node, unknown repo, batch and global ids,graphql,P0,done,invalid-field; unauthenticated; node-repository; unknown-repository; batched-operations; global-id-stability
+mcp discover, initialize and tools/list,mcp,P0,done,server-discover; initialize; tools-list; tool-schemas; tools-list-idempotent
+mcp create and list issue, create and merge PR, REST parity,mcp,P0,done,create-issue; list-issues; create-pull-request; merge-pull-request; rest-parity
+mcp unknown tool, parse error, missing args, concurrent calls and auth,mcp,P0,done,unknown-tool; parse-error; missing-arguments; concurrent-calls; auth-required
+perf push 200 x 1 KiB (T_ref 1640.82 ms),perf,P1,done,bench push
+perf clone 50 x shallow depth 1 of a 200-commit repo (266.941 ms),perf,P1,done,bench clone
+perf read 2000 GETs of one issue on one keep-alive connection (2759.715 ms),perf,P1,done,bench read
+perf write 200 issue creates (348.965 ms),perf,P1,done,bench write
 perf pack deltas on write,perf,P2,cut,whole-object packs only (D1); 0 deltas passes pack-deltas
-extra REST endpoints (search/users/rate_limit),rest,P2,cut,not in any check; only / and /meta served
-design tokens / component specs / screenshots / demo seed data,ui,P2,cut,no visual surface in this bounty (D10)
+extra REST endpoints (search, users, rate_limit),rest,P2,cut,not in any check; only / and /meta served
+design tokens, component specs, screenshots and demo seed data,ui,P2,cut,no visual surface in this bounty (D10)

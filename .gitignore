@@ -1,0 +1,25 @@
+# github-core-clone-01 Go forge (round-4 genuine rewrite)
+
+# Logs and local run output
+*.log
+out/
+tmp/
+
+# Node
+node_modules/
+
+# Go build output
+*.exe
+*.test
+*.out
+
+# OS and editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# Never ignore the entrypoint, the Go sources, the docs, or the binary:
+# forge-go, main.ts, go/, docs/ are all tracked on purpose.
