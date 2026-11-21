@@ -1,13 +1,14 @@
 // js.go — Go stand-ins for JavaScript built-ins.
 //
-// The original forge was TypeScript, and the conformance suite was written
-// against JS semantics. Where Go and JS disagree — JSON escaping, Number()
-// coercion, parseInt, decodeURIComponent, URLSearchParams ordering, Array
-// slice indexing, String() coercion — this file bridges the gap so served
-// bytes match what the TS server would have produced.
+// The forge was specified against JS semantics, and the conformance
+// suite was written with those semantics in mind. Where Go and JS
+// disagree — JSON escaping, Number() coercion, parseInt, URI decoding,
+// URLSearchParams ordering, Array slice indexing, String() coercion —
+// this file bridges the gap so the bytes the server sends match what a
+// JS implementation would have produced.
 //
-// Nothing here touches the network or the disk; everything is pure
-// transformation of values already in memory.
+// Everything here is a pure transformation of values already in memory:
+// no network, no disk, no clock, no randomness.
 
 package main
 
@@ -25,27 +26,29 @@ import (
 	"unicode/utf8"
 )
 
-// marshalJSON renders v the way JSON.stringify would: angle brackets and
-// ampersands stay literal (Go's encoder escapes them by default), and map
-// keys come out sorted, which encoding/json does for us. The encoder's
-// trailing newline is stripped; callers that want one append it.
+// --------------------------------------------------------------------- JSON
+
+// marshalJSON renders v the way JSON.stringify would: angle brackets
+// and ampersands stay literal (Go's encoder escapes them by default),
+// and map keys come out sorted, which encoding/json does for us. The
+// encoder's trailing newline is stripped; callers that want one append
+// it themselves.
 func marshalJSON(v any) []byte {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(v)
-	out := buf.Bytes()
-	return bytes.TrimSuffix(out, []byte("\n"))
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 }
 
-// jsonQuote quotes one string as a JSON string literal, for error messages
-// that embed a quoted value.
+// jsonQuote quotes one string as a JSON string literal, for error
+// messages that embed a quoted value.
 func jsonQuote(s string) string {
 	return string(marshalJSON(s))
 }
 
-// parseJSON is JSON.parse: one value, no trailing junk, numbers decoded
-// with full precision first and converted to float64 afterwards.
+// parseJSON is JSON.parse: one value, no trailing junk, with numbers
+// decoded at full precision first and converted to float64 afterwards.
 func parseJSON(data []byte) (any, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -64,8 +67,9 @@ func parseJSON(data []byte) (any, error) {
 }
 
 // convertNumbers walks a decoded document replacing json.Number leaves
-// with float64. A literal too large for a float64 becomes an infinity with
-// the literal's sign, exactly as JSON.parse('1e400') yields Infinity.
+// with float64. A literal too large for a float64 becomes an infinity
+// with the literal's sign, exactly as JSON.parse('1e400') yields
+// Infinity.
 func convertNumbers(v any) any {
 	switch node := v.(type) {
 	case json.Number:
@@ -92,6 +96,8 @@ func convertNumbers(v any) any {
 	}
 }
 
+// ------------------------------------------------------------------- numbers
+
 // jsNumber is Number(s): surrounding JS whitespace is ignored, an empty
 // (or whitespace-only) string is 0, the Infinity spellings are honoured,
 // underscores are always invalid, and 0x/0b/0o prefixes take a radix
@@ -111,25 +117,14 @@ func jsNumber(s string) (float64, bool) {
 	if strings.Contains(trimmed, "_") {
 		return math.NaN(), false
 	}
-	body := trimmed
-	negative := false
+	body, negative := trimmed, false
 	if strings.HasPrefix(body, "+") {
 		body = body[1:]
 	} else if strings.HasPrefix(body, "-") {
-		negative = true
-		body = body[1:]
+		negative, body = true, body[1:]
 	}
 	if len(body) > 2 {
-		radix := 0
-		switch body[:2] {
-		case "0x", "0X":
-			radix = 16
-		case "0b", "0B":
-			radix = 2
-		case "0o", "0O":
-			radix = 8
-		}
-		if radix != 0 {
+		if radix := jsRadixPrefix(body); radix != 0 {
 			parsed, err := strconv.ParseUint(body[2:], radix, 64)
 			if err != nil {
 				return math.NaN(), false
@@ -146,6 +141,23 @@ func jsNumber(s string) (float64, bool) {
 		return math.NaN(), false
 	}
 	return parsed, true
+}
+
+// jsRadixPrefix returns the radix a 0x/0b/0o-prefixed literal uses, or 0
+// when the string carries no such prefix.
+func jsRadixPrefix(s string) int {
+	if len(s) < 2 {
+		return 0
+	}
+	switch s[:2] {
+	case "0x", "0X":
+		return 16
+	case "0b", "0B":
+		return 2
+	case "0o", "0O":
+		return 8
+	}
+	return 0
 }
 
 // jsParseIntHex is parseInt(head, 16) on a packet-line length header:
@@ -180,78 +192,11 @@ func jsParseIntHex(head string) (int, error) {
 	return int(value), nil
 }
 
-// jsTrim is String.prototype.trim: Unicode WhiteSpace plus line
-// terminators, plus the two extra code points JS counts (BOM, NBSP).
-func jsTrim(s string) string {
-	return strings.TrimFunc(s, func(r rune) bool {
-		return unicode.IsSpace(r) || r == '\uFEFF' || r == '\u00A0'
-	})
-}
-
-// isJSSpace reports whether r is one of the characters JS \s matches.
-func isJSSpace(r rune) bool {
-	switch r {
-	case '\t', '\n', '\v', '\f', '\r', ' ', '\u00A0', '\u1680', '\u2028', '\u2029', '\u202F', '\u205F', '\u3000', '\uFEFF':
-		return true
-	}
-	return r >= '\u2000' && r <= '\u200A'
-}
-
-// jsDecodeURIComponent is decodeURIComponent: percent-decoding that fails
-// on a malformed escape and on escapes that do not form valid UTF-8.
-func jsDecodeURIComponent(s string) (string, error) {
-	decoded, err := url.PathUnescape(s)
-	if err != nil {
-		return "", err
-	}
-	if !utf8.ValidString(decoded) {
-		return "", fmt.Errorf("URIError: URI malformed")
-	}
-	return decoded, nil
-}
-
-// jsString is String(v). Note the JS quirks preserved here: null/undefined
-// become the words "null"/"undefined" (nil in our decoded JSON is the
-// undefined case), arrays join their elements with commas (nullish
-// elements contribute nothing), and plain objects become the literal
-// "[object Object]".
-func jsString(v any) string {
-	switch val := v.(type) {
-	case nil:
-		return "undefined"
-	case string:
-		return val
-	case bool:
-		if val {
-			return "true"
-		}
-		return "false"
-	case float64:
-		return jsNumberString(val)
-	case json.Number:
-		f, _ := val.Float64()
-		return jsNumberString(f)
-	case []any:
-		parts := make([]string, len(val))
-		for i, elem := range val {
-			if elem == nil {
-				parts[i] = ""
-			} else {
-				parts[i] = jsString(elem)
-			}
-		}
-		return strings.Join(parts, ",")
-	case map[string]any:
-		return "[object Object]"
-	default:
-		return fmt.Sprintf("%v", v)
-	}
-}
-
-// jsNumberString is String(n) for a float64 — ECMAScript Number::toString.
-// The shortest decimal digits are taken from Go's 'e' format, then laid
-// out in plain notation when the decimal point lands in [-6, 21] and in
-// exponential notation (unpadded exponent, always signed) otherwise.
+// jsNumberString is String(n) for a float64 — ECMAScript
+// Number::toString. The shortest decimal digits are taken from Go's 'e'
+// format, then laid out in plain notation when the decimal point lands
+// in [-6, 21] and in exponential notation (unpadded exponent, always
+// signed) otherwise.
 func jsNumberString(f float64) string {
 	switch {
 	case math.IsNaN(f):
@@ -290,7 +235,8 @@ func jsNumberString(f float64) string {
 	return rendered
 }
 
-// jsExp formats an exponent the JS way: always signed, never zero-padded.
+// jsExp formats an exponent the JS way: always signed, never
+// zero-padded.
 func jsExp(exp int) string {
 	if exp >= 0 {
 		return "+" + strconv.Itoa(exp)
@@ -309,6 +255,77 @@ func jsTrunc(f float64) int64 {
 		return 0
 	}
 	return int64(math.Trunc(f))
+}
+
+// ------------------------------------------------------------ strings & slices
+
+// jsTrim is String.prototype.trim: Unicode WhiteSpace plus line
+// terminators, plus the two extra code points JS counts (BOM, NBSP).
+func jsTrim(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || r == '\uFEFF' || r == '\u00A0'
+	})
+}
+
+// isJSSpace reports whether r is one of the characters JS \s matches.
+func isJSSpace(r rune) bool {
+	switch r {
+	case '\t', '\n', '\v', '\f', '\r', ' ', '\u00A0', '\u1680', '\u2028', '\u2029', '\u202F', '\u205F', '\u3000', '\uFEFF':
+		return true
+	}
+	return r >= '\u2000' && r <= '\u200A'
+}
+
+// jsDecodeURIComponent is decodeURIComponent: percent-decoding that
+// fails on a malformed escape and on escapes that do not form valid
+// UTF-8.
+func jsDecodeURIComponent(s string) (string, error) {
+	decoded, err := url.PathUnescape(s)
+	if err != nil {
+		return "", err
+	}
+	if !utf8.ValidString(decoded) {
+		return "", fmt.Errorf("URIError: URI malformed")
+	}
+	return decoded, nil
+}
+
+// jsString is String(v). Note the JS quirks preserved here: null and
+// undefined become the words "null" and "undefined" (nil in our decoded
+// JSON is the undefined case), arrays join their elements with commas
+// (nullish elements contribute nothing), and plain objects become the
+// literal "[object Object]".
+func jsString(v any) string {
+	switch val := v.(type) {
+	case nil:
+		return "undefined"
+	case string:
+		return val
+	case bool:
+		if val {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return jsNumberString(val)
+	case json.Number:
+		f, _ := val.Float64()
+		return jsNumberString(f)
+	case []any:
+		parts := make([]string, len(val))
+		for i, elem := range val {
+			if elem == nil {
+				parts[i] = ""
+			} else {
+				parts[i] = jsString(elem)
+			}
+		}
+		return strings.Join(parts, ",")
+	case map[string]any:
+		return "[object Object]"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // jsSlice returns the [lo, hi) window Array.prototype.slice(start, end)
@@ -349,19 +366,31 @@ func jsSliceFrom(length int, start float64) (int, int) {
 	return jsSlice(length, start, float64(length))
 }
 
-// keepBase64Alphabet drops every rune that is not part of the standard
+// -------------------------------------------------------------------- base64
+
+// stripBase64Alphabet drops every rune that is not part of the named
 // base64 alphabet (plus '='), the way Node's Buffer.from tolerates stray
 // characters instead of failing.
-func keepBase64Alphabet(s string) string {
+func stripBase64Alphabet(s string, urlSafe bool) string {
 	var clean strings.Builder
 	clean.Grow(len(s))
 	for _, c := range s {
 		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '+' || c == '/' || c == '=':
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '=':
+			clean.WriteRune(c)
+		case urlSafe && (c == '-' || c == '_'):
+			clean.WriteRune(c)
+		case !urlSafe && (c == '+' || c == '/'):
 			clean.WriteRune(c)
 		}
 	}
 	return clean.String()
+}
+
+// keepBase64Alphabet drops every rune that is not part of the standard
+// base64 alphabet (plus '=').
+func keepBase64Alphabet(s string) string {
+	return stripBase64Alphabet(s, false)
 }
 
 // padBase64 appends '=' until the length is a multiple of four.
@@ -372,14 +401,12 @@ func padBase64(s string) string {
 	return s
 }
 
-// lenientBase64Decode is Node's Buffer.from(s, 'base64'): foreign
-// characters ignored, missing padding tolerated, and a best-effort decode
-// of whatever survives rather than an error.
-func lenientBase64Decode(s string) []byte {
-	cleaned := padBase64(keepBase64Alphabet(s))
-	out, err := base64.StdEncoding.DecodeString(cleaned)
+// decodePaddedBestEffort decodes a padded base64 string, falling back to
+// a padding-stripped decode when the padded form fails.
+func decodePaddedBestEffort(padded string, decode func(string) ([]byte, error)) []byte {
+	out, err := decode(padded)
 	if err != nil {
-		out, _ = base64.StdEncoding.DecodeString(strings.TrimRight(cleaned, "="))
+		out, _ = decode(strings.TrimRight(padded, "="))
 		if out == nil {
 			return []byte{}
 		}
@@ -387,21 +414,20 @@ func lenientBase64Decode(s string) []byte {
 	return out
 }
 
+// lenientBase64Decode is Node's Buffer.from(s, 'base64'): foreign
+// characters ignored, missing padding tolerated, and a best-effort
+// decode of whatever survives rather than an error.
+func lenientBase64Decode(s string) []byte {
+	return decodePaddedBestEffort(padBase64(keepBase64Alphabet(s)), base64.StdEncoding.DecodeString)
+}
+
 // lenientBase64urlDecode is Node's Buffer.from(s, 'base64url'): same
 // leniency as lenientBase64Decode, but over the URL-safe alphabet.
 func lenientBase64urlDecode(s string) []byte {
-	var clean strings.Builder
-	clean.Grow(len(s))
-	for _, c := range s {
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-' || c == '_' || c == '=':
-			clean.WriteRune(c)
-		}
-	}
-	padded := padBase64(clean.String())
-	out, err := base64.URLEncoding.DecodeString(padded)
+	cleaned := padBase64(stripBase64Alphabet(s, true))
+	out, err := base64.URLEncoding.DecodeString(cleaned)
 	if err != nil {
-		out, _ = base64.RawURLEncoding.DecodeString(strings.TrimRight(padded, "="))
+		out, _ = base64.RawURLEncoding.DecodeString(strings.TrimRight(cleaned, "="))
 		if out == nil {
 			return []byte{}
 		}
@@ -415,7 +441,7 @@ func base64urlEncode(b []byte) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-// --- query strings -------------------------------------------------------
+// --------------------------------------------------------------- query strings
 
 // queryParams is URLSearchParams: an ordered list of pairs. Get returns
 // the first value for a name, Set replaces in place (dropping later
@@ -446,8 +472,8 @@ func parseQueryParams(raw string) queryParams {
 }
 
 // queryUnescape decodes one query component: '+' is a space and %XX is
-// the byte it names. A '%' that is not followed by two hex digits is left
-// alone — URLSearchParams never throws while parsing.
+// the byte it names. A '%' that is not followed by two hex digits is
+// left alone — URLSearchParams never throws while parsing.
 func queryUnescape(s string) string {
 	if !strings.ContainsAny(s, "+%") {
 		return s
@@ -509,9 +535,9 @@ func (qp *queryParams) Clone() queryParams {
 	return out
 }
 
-// formEncode renders one component the way URLSearchParams.toString does:
-// alphanumerics plus *-._ pass through, a space becomes '+', and every
-// other byte becomes an uppercase %XX escape.
+// formEncode renders one component the way URLSearchParams.toString
+// does: alphanumerics plus *-._ pass through, a space becomes '+', and
+// every other byte becomes an uppercase %XX escape.
 func formEncode(s string) string {
 	var out strings.Builder
 	out.Grow(len(s))
@@ -538,6 +564,8 @@ func (qp *queryParams) String() string {
 	return strings.Join(parts, "&")
 }
 
+// ------------------------------------------------------------- JSON accessors
+
 // asRecord passes a decoded JSON object through and turns anything else
 // into an empty object.
 func asRecord(v any) map[string]any {
@@ -554,9 +582,9 @@ func asStringValue(v any) (string, bool) {
 	return s, ok
 }
 
-// intParam reads a query parameter as Number(raw): it must be finite and
-// greater than zero, and is then truncated toward zero. Anything else
-// yields the fallback.
+// intParam reads a query parameter as Number(raw): it must be finite
+// and greater than zero, and is then truncated toward zero. Anything
+// else yields the fallback.
 func intParam(qp queryParams, name string, fallback int) int {
 	raw, ok := qp.Get(name)
 	if !ok {

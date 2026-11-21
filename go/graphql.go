@@ -1,187 +1,218 @@
 // graphql.go — the GraphQL v4 endpoint at POST /api/graphql.
 //
-// A deliberately small executor, not a general GraphQL engine: it understands
-// exactly the documents the trial clients send — viewer and repository reads,
-// issue and pull-request connections, node() lookups, __type introspection,
-// the five mutations, and batched request arrays. Anything outside that shape
-// still gets a spec-shaped answer: an unknown field comes back as HTTP 200
-// with an errors entry naming the field, an unknown repository as
-// data.repository null with no errors, and a missing bearer token as exactly
-// 401.
+// This is a small executor for exactly the documents the trial clients
+// send, not a general GraphQL engine: viewer and repository reads, issue
+// and pull-request connections, Relay node() lookups, __type probes, the
+// five mutations, and batched request arrays. Anything outside that shape
+// still gets a spec-shaped answer: an unknown field is HTTP 200 with an
+// errors entry naming the field, an unknown repository is data.repository
+// null with no errors, and a missing bearer token is exactly 401.
 //
-// Two wire rules matter throughout (see docs/DECISIONS.md D5 and D13):
-// global ids are opaque base64url blobs over a one-letter tag plus ids, and
-// this layer spells states in capitals — OPEN, CLOSED, MERGED, MERGEABLE,
-// CONFLICTING — where the REST layer spells them lowercase. Both layers read
-// the same stored state, so they can never drift apart.
+// Two wire rules run through the whole file (see docs/DECISIONS.md D5 and
+// D13): global ids are opaque base64url blobs over a one-letter tag plus
+// ids, decodable again for node() and mutations without a lookup table,
+// and this layer spells states in capitals — OPEN, CLOSED, MERGED,
+// MERGEABLE, CONFLICTING — where the REST layer spells them lowercase.
+// Both layers read the same stored state, so they cannot drift apart.
 //
-// The whole module is in-memory and allocation-light on the hot paths: the
-// lexer works on the raw document bytes, the parser builds one small tree,
-// and the resolvers walk the store's slices directly.
+// Everything is in memory: the lexer works on the raw document text, the
+// parser builds one small selection tree, and the resolvers walk the
+// store's slices directly. No per-request disk I/O anywhere.
 
 package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math"
 	"net/http"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 )
 
 // ---------------------------------------------------------------------------
-// Lexer: a GraphQL document becomes a flat token list.
+// Lexer: a GraphQL document becomes a flat list of small tokens.
 //
-// String literals are kept in their JSON-quoted form (marshalJSON output),
-// so the parser can hand them straight to json.Unmarshal. Everything else
-// is a bare word: punctuation, names, numbers, "...", "$".
+// String literals are decoded at scan time (json.Unmarshal of the raw
+// literal, so escapes come out right) and carried as plain Go strings.
+// Everything else is a bare word, a number, or one punctuation byte.
 
-func tokenize(input string) []string {
-	tokens := []string{}
+type tokKind int
+
+const (
+	tkPunct tokKind = iota
+	tkName
+	tkString
+	tkNumber
+	tkSpread
+	tkDollar
+)
+
+type token struct {
+	kind tokKind
+	text string
+}
+
+func lexDoc(src string) []token {
+	out := []token{}
 	i := 0
-	for i < len(input) {
-		ch := input[i]
+	for i < len(src) {
+		ch := src[i]
 		switch {
 		case isJSSpace(rune(ch)):
 			i++
 		case ch == '#':
-			// Comment: run to the end of the line.
-			for i < len(input) && input[i] != '\n' {
+			for i < len(src) && src[i] != '\n' {
 				i++
 			}
-		case ch == '.' && strings.HasPrefix(input[i:], "..."):
-			tokens = append(tokens, "...")
+		case ch == '.' && strings.HasPrefix(src[i:], "..."):
+			out = append(out, token{kind: tkSpread, text: "..."})
 			i += 3
-		case strings.IndexByte("{}():,=!@$[]", ch) >= 0:
-			tokens = append(tokens, string(ch))
-			i++
 		case ch == '"':
-			tokens = append(tokens, tokenizeQuoted(input, &i))
-		case ch == '_' || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'):
+			text, next := scanQuoted(src, i)
+			out = append(out, token{kind: tkString, text: text})
+			i = next
+		case ch == '$':
+			out = append(out, token{kind: tkDollar, text: "$"})
+			i++
+		case strings.IndexByte("{}():,=![]", ch) >= 0:
+			out = append(out, token{kind: tkPunct, text: string(ch)})
+			i++
+		case ch == '_' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z':
 			j := i + 1
-			for j < len(input) && isNameByte(input[j]) {
+			for j < len(src) && isNameByte(src[j]) {
 				j++
 			}
-			tokens = append(tokens, input[i:j])
+			out = append(out, token{kind: tkName, text: src[i:j]})
 			i = j
-		case (ch >= '0' && ch <= '9') || ch == '-':
+		case ch >= '0' && ch <= '9' || ch == '-' && i+1 < len(src) && src[i+1] >= '0' && src[i+1] <= '9':
 			j := i + 1
-			for j < len(input) && isNumberByte(input[j]) {
+			for j < len(src) && isNumberByte(src[j]) {
 				j++
 			}
-			tokens = append(tokens, input[i:j])
+			out = append(out, token{kind: tkNumber, text: src[i:j]})
 			i = j
 		default:
 			// Any other byte is not part of the grammar; drop it.
 			i++
 		}
 	}
-	return tokens
+	return out
 }
 
-// isNameByte reports whether b can continue a GraphQL name after its first
-// character (letters, digits, underscore).
+// isNameByte reports whether b can continue a GraphQL name.
 func isNameByte(b byte) bool {
-	return b == '_' || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+	return b == '_' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9'
 }
 
-// isNumberByte reports whether b can continue a numeric literal, including
-// the exponent markers a float may carry.
+// isNumberByte reports whether b can continue a numeric literal.
 func isNumberByte(b byte) bool {
-	return (b >= '0' && b <= '9') || b == '.' || b == 'e' || b == 'E' || b == '+' || b == '-'
+	return b >= '0' && b <= '9' || b == '.' || b == 'e' || b == 'E' || b == '+' || b == '-'
 }
 
-// tokenizeQuoted scans one double-quoted literal starting at input[*pos]
-// and advances *pos just past the closing quote. A backslash escapes the
-// next byte verbatim (the backslash itself is dropped), matching the
-// behaviour the documents in the suite rely on. The result is the literal
-// re-encoded as JSON, ready for json.Unmarshal in parseValue.
-func tokenizeQuoted(input string, pos *int) string {
-	var raw strings.Builder
-	j := *pos + 1
-	for j < len(input) && input[j] != '"' {
-		if input[j] == '\\' && j+1 < len(input) {
-			raw.WriteByte(input[j+1])
+// scanQuoted reads one double-quoted literal starting at src[start] and
+// returns its decoded value plus the index just past the closing quote.
+// A backslash escapes the next byte, so the raw slice is valid JSON text
+// for json.Unmarshal; on a malformed literal the inner bytes are used raw.
+func scanQuoted(src string, start int) (string, int) {
+	j := start + 1
+	for j < len(src) && src[j] != '"' {
+		if src[j] == '\\' && j+1 < len(src) {
 			j += 2
 			continue
 		}
-		raw.WriteByte(input[j])
 		j++
 	}
-	*pos = j + 1
-	return string(marshalJSON(raw.String()))
+	end := j + 1
+	if end > len(src) {
+		end = len(src)
+	}
+	var decoded string
+	if err := json.Unmarshal([]byte(src[start:end]), &decoded); err == nil {
+		return decoded, end
+	}
+	inner := src[start+1 : end-1]
+	if end-1 <= start+1 {
+		inner = ""
+	}
+	return inner, end
 }
 
 // ---------------------------------------------------------------------------
 // Parser: the token list becomes one operation with a selection tree.
 //
-// gqlVar marks a variable reference ($name) inside a parsed value; it is
-// resolved against the request's variables map only when the field runs, so
-// the same parsed document could be reused across requests.
+// A $name inside a parsed value is kept as a varRef and resolved against
+// the request's variables map only when the field runs, so the same parsed
+// document could be reused across requests.
 
-// gqlVar is a variable reference ($name) inside a parsed value.
-type gqlVar struct{ name string }
+type varRef struct{ name string }
 
-type gqlField struct {
-	alias      *string
-	name       string
-	args       map[string]any
-	selections []*gqlField // nil = no sub-selections
-	inlineType *string
+// sel is one field in a selection set. alias holds the response key when
+// the document wrote one ("Issue: __type(...)"); cond marks fields that
+// came from an inline fragment ("... on Repository"), which only apply
+// when the value's type matches.
+type sel struct {
+	alias   string
+	name    string
+	args    map[string]any
+	kids    []*sel
+	cond    string
+	hasCond bool
 }
 
-type gqlOperation struct {
-	kind       string // "query" | "mutation"
-	selections []*gqlField
+type docOp struct {
+	mutation bool
+	fields   []*sel
 }
 
-type gqlParser struct {
-	pos    int
-	tokens []string
+type docParser struct {
+	toks []token
+	pos  int
 }
 
-func (p *gqlParser) peek() (string, bool) {
-	if p.pos < len(p.tokens) {
-		return p.tokens[p.pos], true
+func (p *docParser) peek() (token, bool) {
+	if p.pos < len(p.toks) {
+		return p.toks[p.pos], true
 	}
-	return "", false
+	return token{}, false
 }
 
-func (p *gqlParser) next() (string, bool) {
-	if p.pos < len(p.tokens) {
-		t := p.tokens[p.pos]
+func (p *docParser) next() (token, bool) {
+	if p.pos < len(p.toks) {
+		t := p.toks[p.pos]
 		p.pos++
 		return t, true
 	}
-	return "", false
+	return token{}, false
 }
 
-func (p *gqlParser) expect(tok string) error {
+func (p *docParser) expectPunct(want string) error {
 	got, ok := p.next()
-	if !ok || got != tok {
-		seen := "end"
+	if !ok || got.kind != tkPunct || got.text != want {
+		seen := "end of document"
 		if ok {
-			seen = got
+			seen = got.text
 		}
-		return fmt.Errorf("expected %s, got %s", tok, seen)
+		return fmt.Errorf("expected %s, got %s", want, seen)
 	}
 	return nil
 }
 
-// skipParens consumes a balanced, parenthesised group — the variable
-// definitions after an operation name, which this executor never needs to
-// interpret because variables arrive in the request body.
-func (p *gqlParser) skipParens() {
+// skipBalanced consumes a parenthesised group — the variable definitions
+// after an operation name, which this executor never interprets because
+// variables arrive in the request body. Braces nest too, so a default
+// object value cannot end the skip early.
+func (p *docParser) skipBalanced() {
 	depth := 0
-	for p.pos < len(p.tokens) {
+	for p.pos < len(p.toks) {
 		t, _ := p.next()
-		if t == "(" {
+		if t.kind != tkPunct {
+			continue
+		}
+		switch t.text {
+		case "(", "{":
 			depth++
-		} else if t == ")" {
+		case ")", "}":
 			depth--
 			if depth == 0 {
 				return
@@ -190,164 +221,170 @@ func (p *gqlParser) skipParens() {
 	}
 }
 
-func (p *gqlParser) parseOperation() (gqlOperation, error) {
-	kind := "query"
-	if head, ok := p.peek(); ok && (head == "query" || head == "mutation") {
-		kind, _ = p.next()
+func parseDoc(toks []token) (*docOp, error) {
+	p := &docParser{toks: toks}
+	mut := false
+	if t, ok := p.peek(); ok && t.kind == tkName && (t.text == "query" || t.text == "mutation") {
+		p.next()
+		mut = t.text == "mutation"
 	}
 	// An operation name, when present, is just a label.
-	if head, ok := p.peek(); ok && head != "{" && head != "(" {
+	if t, ok := p.peek(); ok && t.kind == tkName {
 		p.next()
 	}
-	if head, ok := p.peek(); ok && head == "(" {
-		p.skipParens()
+	if t, ok := p.peek(); ok && t.kind == tkPunct && t.text == "(" {
+		p.skipBalanced()
 	}
-	selections, err := p.parseSelectionSet()
+	fields, err := p.parseSelSet()
 	if err != nil {
-		return gqlOperation{}, err
-	}
-	return gqlOperation{kind: kind, selections: selections}, nil
-}
-
-func (p *gqlParser) parseSelectionSet() ([]*gqlField, error) {
-	if err := p.expect("{"); err != nil {
 		return nil, err
 	}
-	fields := []*gqlField{}
+	return &docOp{mutation: mut, fields: fields}, nil
+}
+
+func (p *docParser) parseSelSet() ([]*sel, error) {
+	if err := p.expectPunct("{"); err != nil {
+		return nil, err
+	}
+	fields := []*sel{}
 	for {
 		head, ok := p.peek()
-		if !ok || head == "}" {
+		if !ok || head.kind == tkPunct && head.text == "}" {
 			break
 		}
-		parsed, err := p.parseField()
+		parsed, err := p.parseSel()
 		if err != nil {
 			return nil, err
 		}
 		fields = append(fields, parsed...)
 	}
-	if err := p.expect("}"); err != nil {
+	if err := p.expectPunct("}"); err != nil {
 		return nil, err
 	}
 	return fields, nil
 }
 
-func (p *gqlParser) parseField() ([]*gqlField, error) {
-	if head, ok := p.peek(); ok && head == "..." {
-		return p.parseFragment()
+func (p *docParser) parseSel() ([]*sel, error) {
+	head, ok := p.peek()
+	if !ok {
+		return nil, fmt.Errorf("unexpected end of document")
 	}
-	name, _ := p.next()
-	var alias *string
-	if head, ok := p.peek(); ok && head == ":" {
+	if head.kind == tkSpread {
 		p.next()
-		// Snapshot the alias: taking &name then reassigning name would
-		// make the alias point at the field name instead.
-		a := name
-		alias = &a
-		name, _ = p.next()
-	}
-	args := make(map[string]any)
-	if head, ok := p.peek(); ok && head == "(" {
-		p.next()
-		for {
-			head, ok := p.peek()
-			if !ok || head == ")" {
-				break
-			}
-			argName, _ := p.next()
-			if err := p.expect(":"); err != nil {
-				return nil, err
-			}
-			v, err := p.parseValue()
+		if nt, ok := p.peek(); ok && nt.kind == tkName && nt.text == "on" {
+			p.next()
+			tn, _ := p.next()
+			inner, err := p.parseSelSet()
 			if err != nil {
 				return nil, err
 			}
-			args[argName] = v
-			if head, ok := p.peek(); ok && head == "," {
-				p.next()
+			for _, f := range inner {
+				f.cond = tn.text
+				f.hasCond = true
 			}
+			return inner, nil
 		}
-		if err := p.expect(")"); err != nil {
-			return nil, err
-		}
-	}
-	var selections []*gqlField
-	if head, ok := p.peek(); ok && head == "{" {
-		sel, err := p.parseSelectionSet()
-		if err != nil {
-			return nil, err
-		}
-		selections = sel
-	}
-	return []*gqlField{{alias: alias, name: name, args: args, selections: selections}}, nil
-}
-
-// parseFragment handles a spread after the leading "..." has been seen. An
-// inline fragment ("... on Type { ... }") splices its fields into the
-// enclosing set, tagged with the type condition; a named spread is not used
-// by any document in the suite, so its name is consumed and it contributes
-// nothing.
-func (p *gqlParser) parseFragment() ([]*gqlField, error) {
-	p.next() // consume "..."
-	if head, ok := p.peek(); ok && head == "on" {
+		// A named spread is not used by any document in the suite; consume
+		// its name and contribute nothing.
 		p.next()
-		typeName, _ := p.next()
-		inner, err := p.parseSelectionSet()
+		return nil, nil
+	}
+	first, _ := p.next()
+	f := &sel{name: first.text, args: map[string]any{}}
+	if nt, ok := p.peek(); ok && nt.kind == tkPunct && nt.text == ":" {
+		p.next()
+		real, _ := p.next()
+		f.alias = first.text
+		f.name = real.text
+	}
+	if nt, ok := p.peek(); ok && nt.kind == tkPunct && nt.text == "(" {
+		p.next()
+		args, err := p.parseArgs()
 		if err != nil {
 			return nil, err
 		}
-		for _, f := range inner {
-			f.inlineType = &typeName
-		}
-		return inner, nil
+		f.args = args
 	}
-	p.next() // named fragment spread: consume the name, contribute nothing
-	return []*gqlField{}, nil
+	if nt, ok := p.peek(); ok && nt.kind == tkPunct && nt.text == "{" {
+		kids, err := p.parseSelSet()
+		if err != nil {
+			return nil, err
+		}
+		f.kids = kids
+	}
+	return []*sel{f}, nil
 }
 
-var gqlNumberRe = regexp.MustCompile(`^-?\d+(\.\d+)?$`)
+func (p *docParser) parseArgs() (map[string]any, error) {
+	args := map[string]any{}
+	for {
+		head, ok := p.peek()
+		if !ok || head.kind == tkPunct && head.text == ")" {
+			break
+		}
+		name, _ := p.next()
+		if err := p.expectPunct(":"); err != nil {
+			return nil, err
+		}
+		v, err := p.parseValue()
+		if err != nil {
+			return nil, err
+		}
+		args[name.text] = v
+		if head, ok := p.peek(); ok && head.kind == tkPunct && head.text == "," {
+			p.next()
+		}
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return nil, err
+	}
+	return args, nil
+}
 
-func (p *gqlParser) parseValue() (any, error) {
+func (p *docParser) parseValue() (any, error) {
 	tok, ok := p.next()
 	if !ok {
-		// The reference implementation surfaces this as a TypeError reading
-		// .startsWith of undefined; keep the message so clients see the
-		// same failure for a truncated document.
-		return nil, errors.New("Cannot read properties of undefined (reading 'startsWith')")
+		return nil, fmt.Errorf("unexpected end of document")
 	}
-	switch {
-	case tok == "$":
+	switch tok.kind {
+	case tkDollar:
 		name, _ := p.next()
-		return gqlVar{name: name}, nil
-	case tok == "[":
-		return p.parseList()
-	case tok == "{":
-		return p.parseObject()
-	case strings.HasPrefix(tok, "\""):
-		var s string
-		if err := json.Unmarshal([]byte(tok), &s); err != nil {
+		return varRef{name: name.text}, nil
+	case tkString:
+		return tok.text, nil
+	case tkNumber:
+		f, err := strconv.ParseFloat(tok.text, 64)
+		if err != nil {
 			return nil, err
 		}
-		return s, nil
-	case tok == "true":
-		return true, nil
-	case tok == "false":
-		return false, nil
-	case tok == "null":
-		return nil, nil
-	case gqlNumberRe.MatchString(tok):
-		f, _ := strconv.ParseFloat(tok, 64)
 		return f, nil
-	default:
-		return tok, nil // enum value, kept as a bare string
+	case tkPunct:
+		switch tok.text {
+		case "[":
+			return p.parseList()
+		case "{":
+			return p.parseObject()
+		}
+		return nil, fmt.Errorf("unexpected %s in value position", tok.text)
+	default: // tkName: true, false, null, or a bare enum word
+		switch tok.text {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		case "null":
+			return nil, nil
+		default:
+			return tok.text, nil
+		}
 	}
 }
 
-// parseList reads the elements of a "[" value until the closing bracket.
-func (p *gqlParser) parseList() (any, error) {
+func (p *docParser) parseList() (any, error) {
 	items := []any{}
 	for {
 		head, ok := p.peek()
-		if !ok || head == "]" {
+		if !ok || head.kind == tkPunct && head.text == "]" {
 			break
 		}
 		v, err := p.parseValue()
@@ -355,63 +392,65 @@ func (p *gqlParser) parseList() (any, error) {
 			return nil, err
 		}
 		items = append(items, v)
-		if head, ok := p.peek(); ok && head == "," {
+		if head, ok := p.peek(); ok && head.kind == tkPunct && head.text == "," {
 			p.next()
 		}
 	}
-	if err := p.expect("]"); err != nil {
+	if err := p.expectPunct("]"); err != nil {
 		return nil, err
 	}
 	return items, nil
 }
 
-// parseObject reads the key/value pairs of a "{" value until the closing brace.
-func (p *gqlParser) parseObject() (any, error) {
-	obj := make(map[string]any)
+func (p *docParser) parseObject() (any, error) {
+	obj := map[string]any{}
 	for {
 		head, ok := p.peek()
-		if !ok || head == "}" {
+		if !ok || head.kind == tkPunct && head.text == "}" {
 			break
 		}
 		key, _ := p.next()
-		if err := p.expect(":"); err != nil {
+		if err := p.expectPunct(":"); err != nil {
 			return nil, err
 		}
 		v, err := p.parseValue()
 		if err != nil {
 			return nil, err
 		}
-		obj[key] = v
-		if head, ok := p.peek(); ok && head == "," {
+		obj[key.text] = v
+		if head, ok := p.peek(); ok && head.kind == tkPunct && head.text == "," {
 			p.next()
 		}
 	}
-	if err := p.expect("}"); err != nil {
+	if err := p.expectPunct("}"); err != nil {
 		return nil, err
 	}
 	return obj, nil
 }
 
-// resolveVariables walks a parsed value and substitutes every $name with
-// the matching request variable (a missing variable becomes nil). Lists and
+// ---------------------------------------------------------------------------
+// Argument values: variable substitution and coercion.
+
+// substVars walks a parsed value and substitutes every $name with the
+// matching request variable (a missing variable becomes nil). Lists and
 // objects are rebuilt so the parsed document is never mutated.
-func resolveVariables(value any, variables map[string]any) any {
+func substVars(value any, vars map[string]any) any {
 	switch v := value.(type) {
-	case []any:
-		out := make([]any, len(v))
-		for i, e := range v {
-			out[i] = resolveVariables(e, variables)
-		}
-		return out
-	case gqlVar:
-		if val, ok := variables[v.name]; ok {
+	case varRef:
+		if val, ok := vars[v.name]; ok {
 			return val
 		}
 		return nil
+	case []any:
+		out := make([]any, len(v))
+		for i, e := range v {
+			out[i] = substVars(e, vars)
+		}
+		return out
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for k, e := range v {
-			out[k] = resolveVariables(e, variables)
+			out[k] = substVars(e, vars)
 		}
 		return out
 	default:
@@ -419,44 +458,90 @@ func resolveVariables(value any, variables map[string]any) any {
 	}
 }
 
+// resolvedArgs resolves every argument of a field against the request
+// variables and returns the plain map the resolvers read.
+func resolvedArgs(f *sel, vars map[string]any) map[string]any {
+	out := make(map[string]any, len(f.args))
+	for k, v := range f.args {
+		out[k] = substVars(v, vars)
+	}
+	return out
+}
+
+// argStr reads one argument the way String(v) does, with a missing or nil
+// argument answering "" instead of the word "undefined".
+func argStr(m map[string]any, key string) string {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return ""
+	}
+	return jsString(v)
+}
+
+// numFromAny converts an argument value to an int the way Number(v) does
+// first: a float is accepted only when it is an integer inside the range
+// where a float still represents it exactly; a string parses as a number.
+// Anything else, including a fractional value, matches no number.
+func numFromAny(v any) (int, bool) {
+	switch t := v.(type) {
+	case float64:
+		if !jsIsInteger(t) || t > 9e15 || t < -9e15 {
+			return 0, false
+		}
+		return int(t), true
+	case string:
+		f, ok := jsNumber(t)
+		if !ok || !jsIsInteger(f) || f > 9e15 || f < -9e15 {
+			return 0, false
+		}
+		return int(f), true
+	default:
+		return 0, false
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Schema: the field names each type may answer, plus the small slice of
 // introspection the clients actually ask for.
 //
-// The tables are the allow-list: a field that is not listed for its type is
-// an error, never a silent null. Keeping them as plain data (instead of a
-// generated schema) is what keeps this executor small.
+// The tables are the allow-list: a field that is not listed for its type
+// is an error, never a silent null.
 
-// typeFields lists, per GraphQL type, the fields selectFields may resolve.
-// "__"-prefixed keys never appear here; they are internal carriers on the
-// value maps (see repositoryValue / pullValue) and are never selected.
-var typeFields = map[string][]string{
-	"Query":                 {"viewer", "repository", "node", "__type", "__schema"},
-	"User":                  {"login", "id", "name", "email"},
-	"Repository":            {"id", "databaseId", "name", "nameWithOwner", "owner", "defaultBranchRef", "viewerPermission", "hasIssuesEnabled", "issue", "issues", "pullRequest", "pullRequests"},
-	"Issue":                 {"id", "number", "title", "state", "body"},
-	"PullRequest":           {"id", "number", "headRefName", "baseRefName", "mergeable", "state", "merged", "files"},
-	"IssueConnection":       {"nodes", "pageInfo", "totalCount"},
-	"PullRequestConnection": {"nodes", "pageInfo", "totalCount"},
-	"FileConnection":        {"nodes"},
-	"PageInfo":              {"hasNextPage", "endCursor"},
-	"Ref":                   {"name"},
-	"CommentEdge":           {"node"},
-	"Comment":               {"id", "body"},
-	"File":                  {"path"},
-	"__Type":                {"name", "kind", "fields", "enumValues"},
-	"__Field":               {"name"},
-	"__EnumValue":           {"name"},
+func fieldSet(names ...string) map[string]bool {
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
 }
 
-type introspectionInfo struct {
+var allowedFields = map[string]map[string]bool{
+	"Query":                 fieldSet("viewer", "repository", "node", "__type", "__schema"),
+	"User":                  fieldSet("login", "id", "name", "email"),
+	"Repository":            fieldSet("id", "databaseId", "name", "nameWithOwner", "owner", "defaultBranchRef", "viewerPermission", "hasIssuesEnabled", "issue", "issues", "pullRequest", "pullRequests"),
+	"Issue":                 fieldSet("id", "number", "title", "state", "body"),
+	"PullRequest":           fieldSet("id", "number", "headRefName", "baseRefName", "mergeable", "state", "merged", "files"),
+	"IssueConnection":       fieldSet("nodes", "pageInfo", "totalCount"),
+	"PullRequestConnection": fieldSet("nodes", "pageInfo", "totalCount"),
+	"FileConnection":        fieldSet("nodes"),
+	"PageInfo":              fieldSet("hasNextPage", "endCursor"),
+	"Ref":                   fieldSet("name"),
+	"CommentEdge":           fieldSet("node"),
+	"Comment":               fieldSet("id", "body"),
+	"File":                  fieldSet("path"),
+	"Type":                  fieldSet("name", "kind", "fields", "enumValues"),
+	"Field":                 fieldSet("name"),
+	"EnumValue":             fieldSet("name"),
+}
+
+type typeInfo struct {
 	fields     []string
 	enumValues []string
 }
 
-// introspection answers __type(name:) for the types the suite probes. Only
-// SearchType carries enum values; the object types carry their field lists.
-var introspection = map[string]introspectionInfo{
+// typeCatalog answers __type(name:) for the types the suite probes. Only
+// SearchType carries enum values; the object types carry field lists.
+var typeCatalog = map[string]typeInfo{
 	"Issue":       {fields: []string{"id", "number", "title", "state", "body"}},
 	"PullRequest": {fields: []string{"id", "number", "headRefName", "baseRefName", "mergeable", "state", "merged", "files"}},
 	"Repository":  {fields: []string{"id", "databaseId", "name", "nameWithOwner", "owner", "defaultBranchRef", "viewerPermission", "hasIssuesEnabled", "issue", "issues", "pullRequests", "pullRequest"}},
@@ -464,101 +549,80 @@ var introspection = map[string]introspectionInfo{
 }
 
 // ---------------------------------------------------------------------------
-// Execution context and field selection.
-
-// gqlCtx carries one operation's store, variables, and the errors it has
-// accumulated so far. Errors never abort the operation: a field that fails
-// answers null in place and the rest of the document still runs.
-type gqlCtx struct {
-	store     *Store
-	variables map[string]any
-	errors    []map[string]any
-}
-
-// unknownField records the standard "cannot query field" error and answers
-// nil, which is what the field's slot holds in the response.
-func unknownField(ctx *gqlCtx, typeName, fieldName string) any {
-	ctx.errors = append(ctx.errors, map[string]any{"message": fmt.Sprintf("Cannot query field \"%s\" on type \"%s\".", fieldName, typeName)})
-	return nil
-}
-
-// fieldKey is the response key for a field: its alias when one was written,
-// otherwise its name.
-func fieldKey(f *gqlField) string {
-	if f.alias != nil {
-		return *f.alias
-	}
-	return f.name
-}
-
-// selectFields projects one value map through a selection set. A nil value
-// stays nil (a missing object has no fields to pick), and a nil selection
-// set returns the whole map — the caller asked for the object as a whole.
-// Every selected field is checked against the type's allow-list first.
-func selectFields(ctx *gqlCtx, typeName string, value map[string]any, selections []*gqlField) map[string]any {
-	if value == nil {
-		return nil
-	}
-	if selections == nil {
-		return value
-	}
-	out := make(map[string]any, len(selections))
-	allowed := typeFields[typeName]
-	for _, field := range selections {
-		key := fieldKey(field)
-		if !containsStr(allowed, field.name) {
-			out[key] = unknownField(ctx, typeName, field.name)
-			continue
-		}
-		out[key] = resolveField(ctx, typeName, value, field)
-	}
-	return out
-}
-
-// gqlChild picks the sub-selection named name out of a field's selections,
-// or nil when the field does not select it. Mutation payloads and
-// connections both read their nested objects this way.
-func gqlChild(field *gqlField, name string) []*gqlField {
-	for _, s := range field.selections {
-		if s.name == name {
-			return s.selections
-		}
-	}
-	return nil
-}
-
-// ---------------------------------------------------------------------------
-// Object values: the maps resolvers project through selectFields.
+// Execution context and the node model.
 //
-// Internal carriers use "__"-prefixed keys so they can travel with the
-// value without ever colliding with a real GraphQL field name: "__repo"
-// holds the *Repo a repository field was resolved from, "__pr" the *Pull.
+// A gqlNode is one value the resolvers hand around: its type name, its
+// scalar fields, and — for the types that need live store access — the
+// store object it was resolved from plus, for connections, its children
+// and pageInfo. Projection never sees the store pointers; they travel
+// alongside the scalars and are only read by resolveField.
 
-// gqlIssueState spells a stored lowercase issue state as a GraphQL enum.
-func gqlIssueState(issue *Issue) string {
+type gqlEnv struct {
+	store *Store
+	vars  map[string]any
+	errs  []any
+}
+
+func (e *gqlEnv) failField(typ, field string) {
+	e.errs = append(e.errs, map[string]any{"message": fmt.Sprintf("Cannot query field %q on type %q.", field, typ)})
+}
+
+type gqlNode struct {
+	typ        string
+	vals       map[string]any
+	repo       *Repo
+	issue      *Issue
+	pr         *Pull
+	kids       []any // connection children, each a *gqlNode
+	info       *gqlNode
+	fieldNames []string // __Type.fields source list
+	enumNames  []string // __Type.enumValues source list
+}
+
+func userNode(login string, id int) *gqlNode {
+	return &gqlNode{typ: "User", vals: map[string]any{
+		"login": login, "id": id, "name": viewerName, "email": viewerEmail,
+	}}
+}
+
+func repoNode(repo *Repo) *gqlNode {
+	return &gqlNode{
+		typ:  "Repository",
+		repo: repo,
+		vals: map[string]any{
+			"id":               globalId("R", repo.ID),
+			"databaseId":       repo.ID,
+			"name":             repo.Name,
+			"nameWithOwner":    repo.Owner + "/" + repo.Name,
+			"viewerPermission": "ADMIN",
+			"hasIssuesEnabled": true,
+		},
+	}
+}
+
+func issueStateWord(issue *Issue) string {
 	if issue.State == "open" {
 		return "OPEN"
 	}
 	return "CLOSED"
 }
 
-func issueValue(ctx *gqlCtx, repo *Repo, issueNumber int, selections []*gqlField) map[string]any {
-	issue := ctx.store.GetIssue(repo, issueNumber)
-	if issue == nil {
-		return nil
+func (e *gqlEnv) issueNode(repo *Repo, issue *Issue) *gqlNode {
+	return &gqlNode{
+		typ:   "Issue",
+		repo:  repo,
+		issue: issue,
+		vals: map[string]any{
+			"id":     globalId("I", repo.ID, issue.Number),
+			"number": issue.Number,
+			"title":  issue.Title,
+			"state":  issueStateWord(issue),
+			"body":   issue.Body,
+		},
 	}
-	return selectFields(ctx, "Issue", map[string]any{
-		"id":     globalId("I", repo.ID, issue.Number),
-		"number": issue.Number,
-		"title":  issue.Title,
-		"state":  gqlIssueState(issue),
-		"body":   issue.Body,
-	}, selections)
 }
 
-// gqlPullState spells a stored PR state as a GraphQL enum: a merged PR is
-// MERGED even though its stored state is "closed".
-func gqlPullState(pr *Pull) string {
+func pullStateWord(pr *Pull) string {
 	if pr.Merged {
 		return "MERGED"
 	}
@@ -568,447 +632,275 @@ func gqlPullState(pr *Pull) string {
 	return "CLOSED"
 }
 
-// gqlMergeableWord answers the mergeable enum for a PR from a live conflict
-// check, never from a stored flag.
-func gqlMergeableWord(ctx *gqlCtx, repo *Repo, pr *Pull) string {
-	if ctx.store.MergeConflicts(repo, pr) {
-		return "CONFLICTING"
+func (e *gqlEnv) prNode(repo *Repo, pr *Pull) *gqlNode {
+	mergeable := "MERGEABLE"
+	if e.store.MergeConflicts(repo, pr) {
+		mergeable = "CONFLICTING"
 	}
-	return "MERGEABLE"
-}
-
-func pullValue(ctx *gqlCtx, repo *Repo, pr *Pull, selections []*gqlField) map[string]any {
-	return selectFields(ctx, "PullRequest", map[string]any{
-		"id":          globalId("P", repo.ID, pr.Number),
-		"number":      pr.Number,
-		"headRefName": pr.HeadRef,
-		"baseRefName": pr.BaseRef,
-		"mergeable":   gqlMergeableWord(ctx, repo, pr),
-		"state":       gqlPullState(pr),
-		"merged":      pr.Merged,
-		"__repo":      repo,
-		"__pr":        pr,
-	}, selections)
+	return &gqlNode{
+		typ:  "PullRequest",
+		repo: repo,
+		pr:   pr,
+		vals: map[string]any{
+			"id":          globalId("P", repo.ID, pr.Number),
+			"number":      pr.Number,
+			"headRefName": pr.HeadRef,
+			"baseRefName": pr.BaseRef,
+			"mergeable":   mergeable,
+			"state":       pullStateWord(pr),
+			"merged":      pr.Merged,
+		},
+	}
 }
 
 // ---------------------------------------------------------------------------
-// Cursors and number coercion.
-
-// cursorFor encodes an issue number as the opaque page cursor for the
-// issues connection ("issue:<number>", base64url).
-func cursorFor(number int) string {
-	return base64urlEncode([]byte("issue:" + strconv.Itoa(number)))
-}
-
-var cursorRe = regexp.MustCompile(`^issue:(\d+)$`)
-
-// cursorNumber decodes a page cursor back to its issue number, or nil when
-// the cursor is not one this connection minted.
-func cursorNumber(cursor string) *int {
-	text := string(lenientBase64urlDecode(cursor))
-	m := cursorRe.FindStringSubmatch(text)
-	if m == nil {
-		return nil
-	}
-	n, _ := strconv.Atoi(m[1])
-	return &n
-}
-
-// jsNumberValue coerces a JSON value the way JavaScript's Number(v) does:
-// null is 0, booleans are 0/1, a string parses as a number (or NaN), a
-// single-element array coerces through its element, and anything else is
-// NaN. The GraphQL layer needs it because argument values arrive as
-// untyped JSON — a "number" argument may be a string in disguise.
-func jsNumberValue(v any) float64 {
-	switch t := v.(type) {
-	case nil:
-		return 0
-	case bool:
-		if t {
-			return 1
-		}
-		return 0
-	case float64:
-		return t
-	case string:
-		n, _ := jsNumber(t)
-		return n
-	case []any:
-		if len(t) == 0 {
-			return 0
-		}
-		parts := make([]string, len(t))
-		for i, e := range t {
-			if e == nil {
-				parts[i] = ""
-			} else {
-				parts[i] = jsString(e)
-			}
-		}
-		n, _ := jsNumber(strings.Join(parts, ","))
-		return n
-	default:
-		return math.NaN()
-	}
-}
-
-// gqlSafeInt accepts a float as an id/number only when it is an integer
-// inside the range where a float still represents it exactly.
-func gqlSafeInt(f float64) (int, bool) {
-	if !jsIsInteger(f) {
-		return 0, false
-	}
-	if f > 9e15 || f < -9e15 {
-		return 0, false
-	}
-	return int(f), true
-}
-
-// numFromValue converts a GraphQL argument the way Number(v) does, then to
-// an int when it is an integer (a fractional value never matches a number).
-func numFromValue(v any) (int, bool) {
-	return gqlSafeInt(jsNumberValue(v))
-}
-
-// numArg converts one decoded global-id part the way Number(part) does,
-// then to an int when it is an integer id.
-func numArg(s string) (int, bool) {
-	f, ok := jsNumber(s)
-	if !ok {
-		return 0, false
-	}
-	return gqlSafeInt(f)
-}
-
-// part returns the i-th decoded part, if present. A missing part behaves
-// like JavaScript's undefined: Number(undefined) is NaN, which matches
-// nothing, so callers treat a missing part as "no such object".
-func (d *decodedGlobalId) part(i int) (string, bool) {
-	if i < len(d.Parts) {
-		return d.Parts[i], true
-	}
-	return "", false
-}
-
-// ---------------------------------------------------------------------------
-// Field resolution.
+// Projection: one node through one selection set.
 //
-// resolveField is the single dispatch point: it resolves a field's
-// arguments against the request variables, then hands the field to the
-// handler for its parent type. Handlers fall back to a plain map lookup for
-// scalar fields that already sit on the value, and to nil for anything the
-// value does not carry — a missing scalar is null, never an error.
+// A nil node stays nil (a missing object has no fields to pick), and a nil
+// selection set returns the scalar map whole. Every selected field is
+// checked against the type's allow-list first; an inline-fragment field
+// whose type condition does not match the node is skipped outright.
 
-func resolveField(ctx *gqlCtx, typeName string, value map[string]any, field *gqlField) any {
-	args := make(map[string]any, len(field.args))
-	for k, v := range field.args {
-		args[k] = resolveVariables(v, ctx.variables)
+func (e *gqlEnv) project(n *gqlNode, sels []*sel) map[string]any {
+	if n == nil {
+		return nil
 	}
+	if sels == nil {
+		out := make(map[string]any, len(n.vals))
+		for k, v := range n.vals {
+			out[k] = v
+		}
+		return out
+	}
+	out := make(map[string]any, len(sels))
+	allowed := allowedFields[n.typ]
+	for _, s := range sels {
+		if s.hasCond && s.cond != n.typ {
+			continue
+		}
+		key := s.name
+		if s.alias != "" {
+			key = s.alias
+		}
+		if !allowed[s.name] {
+			e.failField(n.typ, s.name)
+			out[key] = nil
+			continue
+		}
+		out[key] = e.render(e.resolveField(n, s), s.kids)
+	}
+	return out
+}
 
-	switch typeName {
-	case "Query":
-		return gqlQueryField(ctx, field, args)
+// render turns a resolved value into its response shape: a node is
+// projected through the field's sub-selections, a list is rendered
+// element by element, and anything else passes through untouched.
+func (e *gqlEnv) render(v any, kids []*sel) any {
+	switch t := v.(type) {
+	case *gqlNode:
+		if t == nil {
+			return nil
+		}
+		return e.project(t, kids)
+	case []any:
+		out := make([]any, len(t))
+		for i, el := range t {
+			out[i] = e.render(el, kids)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// resolveField is the single dispatch point for a field of an already
+// resolved node: arguments are resolved first, then the field is answered
+// from the node's store object, its children, or its scalar map.
+func (e *gqlEnv) resolveField(n *gqlNode, f *sel) any {
+	args := resolvedArgs(f, e.vars)
+	switch n.typ {
 	case "Repository":
-		return gqlRepositoryField(ctx, value, field, args)
+		return e.repositoryField(n, f, args)
 	case "PullRequest":
-		return gqlPullRequestField(ctx, value, field, args)
-	case "IssueConnection":
-		return gqlIssueConnectionField(ctx, value, field)
-	case "PullRequestConnection":
-		return gqlPullConnectionField(ctx, value, field)
+		if f.name == "files" {
+			return e.filesConn(n.repo, n.pr, args)
+		}
+	case "IssueConnection", "PullRequestConnection":
+		switch f.name {
+		case "nodes":
+			return n.kids
+		case "pageInfo":
+			return n.info
+		}
 	case "FileConnection":
-		return gqlFileConnectionField(ctx, value, field)
-	case "__Type":
-		return gqlTypeField(ctx, value, field)
-	default:
-		if v, ok := value[field.name]; ok {
-			return v
+		if f.name == "nodes" {
+			return n.kids
 		}
-		return nil
-	}
-}
-
-// gqlQueryField answers the five top-level query roots. Anything else is
-// an unknown field on Query.
-func gqlQueryField(ctx *gqlCtx, field *gqlField, args map[string]any) any {
-	switch field.name {
-	case "viewer":
-		return selectFields(ctx, "User", map[string]any{
-			"login": viewerLogin, "id": viewerID, "name": viewerName, "email": viewerEmail,
-		}, field.selections)
-	case "repository":
-		repo := ctx.store.GetRepo(
-			jsString(firstNonNil(args["owner"], "")),
-			jsString(firstNonNil(args["name"], "")),
-		)
-		if repo == nil {
-			// Unknown repository: null, deliberately with no error.
-			return nil
+	case "Type":
+		switch f.name {
+		case "fields":
+			out := make([]any, 0, len(n.fieldNames))
+			for _, name := range n.fieldNames {
+				out = append(out, &gqlNode{typ: "Field", vals: map[string]any{"name": name}})
+			}
+			return out
+		case "enumValues":
+			out := make([]any, 0, len(n.enumNames))
+			for _, name := range n.enumNames {
+				out = append(out, &gqlNode{typ: "EnumValue", vals: map[string]any{"name": name}})
+			}
+			return out
 		}
-		return selectFields(ctx, "Repository", repositoryValue(repo), field.selections)
-	case "node":
-		return gqlNodeField(ctx, jsString(firstNonNil(args["id"], "")), field.selections)
-	case "__type":
-		return gqlIntrospectedType(ctx, jsString(firstNonNil(args["name"], "")), field.selections)
-	case "__schema":
-		return map[string]any{"queryType": map[string]any{"name": "Query"}}
-	default:
-		return unknownField(ctx, "Query", field.name)
 	}
+	if v, ok := n.vals[f.name]; ok {
+		return v
+	}
+	return nil
 }
 
-// gqlNodeField resolves a global id to the object it names. The tag picks
-// the kind — R repository, I issue, P pull request — and each leg re-checks
-// that the decoded repo and number actually exist before answering.
-func gqlNodeField(ctx *gqlCtx, id string, selections []*gqlField) any {
-	decoded := decodeGlobalId(id)
-	if decoded == nil {
-		return nil
-	}
-	switch decoded.Tag {
-	case "R":
-		repo := gqlRepoFromParts(ctx, decoded, 0)
-		if repo == nil {
-			return nil
-		}
-		return selectFields(ctx, "Repository", repositoryValue(repo), selections)
-	case "I":
-		repo, issue := gqlIssueFromParts(ctx, decoded)
-		if repo == nil || issue == nil {
-			return nil
-		}
-		return issueValue(ctx, repo, issue.Number, selections)
-	case "P":
-		repo, pr := gqlPullFromParts(ctx, decoded)
-		if repo == nil || pr == nil {
-			return nil
-		}
-		return pullValue(ctx, repo, pr, selections)
-	default:
-		return nil
-	}
-}
-
-// gqlRepoFromParts decodes the repo id at parts[i] and loads that repo.
-func gqlRepoFromParts(ctx *gqlCtx, decoded *decodedGlobalId, i int) *Repo {
-	part, ok := decoded.part(i)
-	if !ok {
-		return nil
-	}
-	repoID, ok := numArg(part)
-	if !ok {
-		return nil
-	}
-	return ctx.store.GetRepoById(repoID)
-}
-
-// gqlIssueFromParts decodes an "I" id (repo id, issue number) and loads both.
-func gqlIssueFromParts(ctx *gqlCtx, decoded *decodedGlobalId) (*Repo, *Issue) {
-	repo := gqlRepoFromParts(ctx, decoded, 0)
-	if repo == nil {
-		return nil, nil
-	}
-	part, ok := decoded.part(1)
-	if !ok {
-		return repo, nil
-	}
-	num, ok := numArg(part)
-	if !ok {
-		return repo, nil
-	}
-	return repo, ctx.store.GetIssue(repo, num)
-}
-
-// gqlPullFromParts decodes a "P" id (repo id, PR number) and loads both.
-func gqlPullFromParts(ctx *gqlCtx, decoded *decodedGlobalId) (*Repo, *Pull) {
-	repo := gqlRepoFromParts(ctx, decoded, 0)
-	if repo == nil {
-		return nil, nil
-	}
-	part, ok := decoded.part(1)
-	if !ok {
-		return repo, nil
-	}
-	num, ok := numArg(part)
-	if !ok {
-		return repo, nil
-	}
-	return repo, ctx.store.GetPull(repo, num)
-}
-
-// gqlIntrospectedType answers __type(name:) from the introspection table.
-// An enum type reports kind ENUM and its values; an object type reports
-// kind OBJECT and its fields. Unknown names answer null.
-func gqlIntrospectedType(ctx *gqlCtx, name string, selections []*gqlField) any {
-	info, ok := introspection[name]
-	if !ok {
-		return nil
-	}
-	kind := "OBJECT"
-	if info.enumValues != nil {
-		kind = "ENUM"
-	}
-	fields := info.fields
-	if fields == nil {
-		fields = []string{}
-	}
-	enumValues := info.enumValues
-	if enumValues == nil {
-		enumValues = []string{}
-	}
-	return selectFields(ctx, "__Type", map[string]any{
-		"name": name, "kind": kind,
-		"__fields": fields, "__enumValues": enumValues,
-	}, selections)
-}
-
-// gqlRepositoryField answers one field of a repository. The *Repo travels
-// on the value map under "__repo"; scalar fields (id, name, ...) are plain
-// map lookups at the bottom.
-func gqlRepositoryField(ctx *gqlCtx, value map[string]any, field *gqlField, args map[string]any) any {
-	repo := value["__repo"].(*Repo)
-	switch field.name {
+func (e *gqlEnv) repositoryField(n *gqlNode, f *sel, args map[string]any) any {
+	repo := n.repo
+	switch f.name {
 	case "owner":
-		return selectFields(ctx, "User", map[string]any{
-			"login": repo.Owner, "id": viewerID, "name": viewerName, "email": viewerEmail,
-		}, field.selections)
+		return userNode(repo.Owner, viewerID)
 	case "defaultBranchRef":
 		if _, ok := repo.Refs["refs/heads/"+repo.DefaultBranch]; !ok {
 			return nil
 		}
-		return selectFields(ctx, "Ref", map[string]any{"name": repo.DefaultBranch}, field.selections)
+		return &gqlNode{typ: "Ref", vals: map[string]any{"name": repo.DefaultBranch}}
 	case "issue":
-		num, ok := numFromValue(args["number"])
+		num, ok := numFromAny(args["number"])
 		if !ok {
 			return nil
 		}
-		return issueValue(ctx, repo, num, field.selections)
+		issue := e.store.GetIssue(repo, num)
+		if issue == nil {
+			return nil
+		}
+		return e.issueNode(repo, issue)
 	case "issues":
-		return gqlIssuesConnection(ctx, repo, field, args)
+		return e.issuesConn(repo, args)
 	case "pullRequest":
-		num, ok := numFromValue(args["number"])
+		num, ok := numFromAny(args["number"])
 		if !ok {
 			return nil
 		}
-		pr := ctx.store.GetPull(repo, num)
+		pr := e.store.GetPull(repo, num)
 		if pr == nil {
 			return nil
 		}
-		return pullValue(ctx, repo, pr, field.selections)
+		return e.prNode(repo, pr)
 	case "pullRequests":
-		return gqlPullsConnection(ctx, repo, field, args)
-	default:
-		if v, ok := value[field.name]; ok {
-			return v
-		}
-		return nil
+		return e.prsConn(repo, args)
 	}
+	if v, ok := n.vals[f.name]; ok {
+		return v
+	}
+	return nil
 }
 
-// gqlIssuesConnection answers repository.issues as a connection: optional
-// states filter (uppercase enum values compared against the stored state),
-// orderBy (CREATED_AT DESC sorts newest first with ties broken by number
-// DESC, ASC the mirror; anything else falls back to number ASC), cursor
-// pagination via after, and a first page size that defaults to 10.
-func gqlIssuesConnection(ctx *gqlCtx, repo *Repo, field *gqlField, args map[string]any) any {
-	issues := append([]*Issue{}, repo.Issues...)
-	if states, ok := args["states"].([]any); ok {
-		issues = gqlFilterByStates(issues, states)
+// ---------------------------------------------------------------------------
+// Cursors and connections.
+
+// encodeCursor renders an issue number as the opaque page cursor for the
+// issues connection ("issue:<number>", base64url).
+func encodeCursor(number int) string {
+	return base64urlEncode([]byte("issue:" + strconv.Itoa(number)))
+}
+
+// decodeCursor decodes a page cursor back to its issue number, or nil
+// when the cursor is not one this connection minted.
+func decodeCursor(cursor string) *int {
+	raw := string(lenientBase64urlDecode(cursor))
+	if !strings.HasPrefix(raw, "issue:") {
+		return nil
 	}
-	issues = gqlOrderIssues(issues, asRecord(args["orderBy"]))
-	if after, ok := args["after"].(string); ok {
-		if at := cursorNumber(after); at != nil {
-			issues = gqlAfterNumber(issues, *at)
+	n, err := strconv.Atoi(raw[len("issue:"):])
+	if err != nil {
+		return nil
+	}
+	return &n
+}
+
+// issuesConn answers repository.issues as a connection: an optional states
+// filter (uppercase enum values against the stored state), orderBy
+// (CREATED_AT orders by creation sequence with ties broken by number, any
+// other field falls back to number ascending), cursor pagination via
+// after, and a first page size that defaults to 10.
+func (e *gqlEnv) issuesConn(repo *Repo, args map[string]any) *gqlNode {
+	list := append([]*Issue{}, repo.Issues...)
+	if raw, ok := args["states"].([]any); ok {
+		kept := make([]*Issue, 0, len(list))
+		for _, issue := range list {
+			for _, st := range raw {
+				if s, ok := st.(string); ok && s == strings.ToUpper(issue.State) {
+					kept = append(kept, issue)
+					break
+				}
+			}
+		}
+		list = kept
+	}
+	orderBy := asRecord(args["orderBy"])
+	field, _ := orderBy["field"].(string)
+	direction, _ := orderBy["direction"].(string)
+	switch {
+	case field == "CREATED_AT" && direction == "DESC":
+		sort.SliceStable(list, func(a, b int) bool {
+			if list[a].CreatedSeq != list[b].CreatedSeq {
+				return list[a].CreatedSeq > list[b].CreatedSeq
+			}
+			return list[a].Number > list[b].Number
+		})
+	case field == "CREATED_AT" && direction == "ASC":
+		sort.SliceStable(list, func(a, b int) bool {
+			if list[a].CreatedSeq != list[b].CreatedSeq {
+				return list[a].CreatedSeq < list[b].CreatedSeq
+			}
+			return list[a].Number < list[b].Number
+		})
+	default:
+		sort.SliceStable(list, func(a, b int) bool { return list[a].Number < list[b].Number })
+	}
+	if cur, ok := args["after"].(string); ok {
+		if at := decodeCursor(cur); at != nil {
+			for i, issue := range list {
+				if issue.Number == *at {
+					list = list[i+1:]
+					break
+				}
+			}
 		}
 	}
 	first := 10.0
 	if f, ok := args["first"].(float64); ok {
 		first = f
 	}
-	lo, hi := jsSlice(len(issues), 0, first)
-	page := issues[lo:hi]
-	hasNext := len(issues) > int(first)
+	lo, hi := jsSlice(len(list), 0, first)
+	page := list[lo:hi]
+	kids := make([]any, 0, len(page))
+	for _, issue := range page {
+		kids = append(kids, e.issueNode(repo, issue))
+	}
 	var endCursor any
 	if len(page) > 0 {
-		endCursor = cursorFor(page[len(page)-1].Number)
+		endCursor = encodeCursor(page[len(page)-1].Number)
 	}
-	nodes := make([]any, 0, len(page))
-	for _, issue := range page {
-		nodes = append(nodes, issueValue(ctx, repo, issue.Number, gqlChild(field, "nodes")))
+	node := &gqlNode{
+		typ:  "IssueConnection",
+		vals: map[string]any{"totalCount": len(list)},
+		kids: kids,
 	}
-	pageInfoSel := gqlChild(field, "pageInfo")
-	var pageInfo any
-	if pageInfoSel != nil {
-		pageInfo = selectFields(ctx, "PageInfo", map[string]any{"hasNextPage": hasNext, "endCursor": endCursor}, pageInfoSel)
-	} else {
-		pageInfo = map[string]any{"hasNextPage": hasNext, "endCursor": endCursor}
-	}
-	return selectFields(ctx, "IssueConnection", map[string]any{
-		"__nodes":    nodes,
-		"__pageInfo": map[string]any{"hasNextPage": hasNext, "endCursor": endCursor},
-		"totalCount": len(issues),
-		"nodes":      nodes,
-		"pageInfo":   pageInfo,
-	}, field.selections)
+	node.info = &gqlNode{typ: "PageInfo", vals: map[string]any{
+		"hasNextPage": hi < len(list),
+		"endCursor":   endCursor,
+	}}
+	return node
 }
 
-// gqlFilterByStates keeps only the issues whose stored state, uppercased,
-// appears in the requested states list.
-func gqlFilterByStates(issues []*Issue, states []any) []*Issue {
-	var kept []*Issue
-	for _, issue := range issues {
-		upper := strings.ToUpper(issue.State)
-		for _, st := range states {
-			if st == upper {
-				kept = append(kept, issue)
-				break
-			}
-		}
-	}
-	return kept
-}
-
-// gqlOrderIssues sorts a copy of the issue list per orderBy. CREATED_AT
-// orders by creation sequence (ties by number, same direction); any other
-// field orders by number ascending.
-func gqlOrderIssues(issues []*Issue, orderBy map[string]any) []*Issue {
-	field, _ := orderBy["field"].(string)
-	direction, _ := orderBy["direction"].(string)
-	switch {
-	case field == "CREATED_AT" && direction == "DESC":
-		sort.SliceStable(issues, func(a, b int) bool {
-			if issues[a].CreatedSeq != issues[b].CreatedSeq {
-				return issues[a].CreatedSeq > issues[b].CreatedSeq
-			}
-			return issues[a].Number > issues[b].Number
-		})
-	case field == "CREATED_AT" && direction == "ASC":
-		sort.SliceStable(issues, func(a, b int) bool {
-			if issues[a].CreatedSeq != issues[b].CreatedSeq {
-				return issues[a].CreatedSeq < issues[b].CreatedSeq
-			}
-			return issues[a].Number < issues[b].Number
-		})
-	default:
-		sort.SliceStable(issues, func(a, b int) bool { return issues[a].Number < issues[b].Number })
-	}
-	return issues
-}
-
-// gqlAfterNumber drops every element up to and including the one with the
-// given number; a number that is not in the list drops nothing.
-func gqlAfterNumber(issues []*Issue, number int) []*Issue {
-	for i, issue := range issues {
-		if issue.Number == number {
-			return issues[i+1:]
-		}
-	}
-	return issues
-}
-
-// gqlPullsConnection answers repository.pullRequests: number ascending, a
-// first page size defaulting to 10, totalCount over all of the repo's PRs.
-func gqlPullsConnection(ctx *gqlCtx, repo *Repo, field *gqlField, args map[string]any) any {
+// prsConn answers repository.pullRequests: number ascending, a first page
+// size defaulting to 10, totalCount over all of the repo's PRs.
+func (e *gqlEnv) prsConn(repo *Repo, args map[string]any) *gqlNode {
 	first := 10.0
 	if f, ok := args["first"].(float64); ok {
 		first = f
@@ -1017,136 +909,158 @@ func gqlPullsConnection(ctx *gqlCtx, repo *Repo, field *gqlField, args map[strin
 	sort.SliceStable(pulls, func(a, b int) bool { return pulls[a].Number < pulls[b].Number })
 	lo, hi := jsSlice(len(pulls), 0, first)
 	page := pulls[lo:hi]
-	nodes := make([]any, 0, len(page))
+	kids := make([]any, 0, len(page))
 	for _, pr := range page {
-		nodes = append(nodes, pullValue(ctx, repo, pr, gqlChild(field, "nodes")))
+		kids = append(kids, e.prNode(repo, pr))
 	}
-	return selectFields(ctx, "PullRequestConnection", map[string]any{
-		"__nodes": nodes, "nodes": nodes, "totalCount": len(repo.Pulls),
-	}, field.selections)
+	return &gqlNode{
+		typ:  "PullRequestConnection",
+		vals: map[string]any{"totalCount": len(repo.Pulls)},
+		kids: kids,
+	}
 }
 
-// gqlPullRequestField answers the files connection of a PR (its merge-base
-// diff, first 10 by default) and plain map lookups for its scalars.
-func gqlPullRequestField(ctx *gqlCtx, value map[string]any, field *gqlField, args map[string]any) any {
-	if field.name == "files" {
-		repo := value["__repo"].(*Repo)
-		pr := value["__pr"].(*Pull)
-		first := 10.0
-		if f, ok := args["first"].(float64); ok {
-			first = f
-		}
-		files := ctx.store.PullFiles(repo, pr)
-		lo, hi := jsSlice(len(files), 0, first)
-		page := files[lo:hi]
-		nodes := make([]any, 0, len(page))
-		for _, f := range page {
-			nodes = append(nodes, selectFields(ctx, "File", map[string]any{"path": f.Path}, gqlChild(field, "nodes")))
-		}
-		return selectFields(ctx, "FileConnection", map[string]any{"nodes": nodes}, field.selections)
+// filesConn answers a pull request's files connection: its merge-base
+// diff, first 10 by default, each node carrying just the changed path.
+func (e *gqlEnv) filesConn(repo *Repo, pr *Pull, args map[string]any) *gqlNode {
+	first := 10.0
+	if f, ok := args["first"].(float64); ok {
+		first = f
 	}
-	if v, ok := value[field.name]; ok {
-		return v
+	changes := e.store.PullFiles(repo, pr)
+	lo, hi := jsSlice(len(changes), 0, first)
+	page := changes[lo:hi]
+	kids := make([]any, 0, len(page))
+	for _, ch := range page {
+		kids = append(kids, &gqlNode{typ: "File", vals: map[string]any{"path": ch.Path}})
 	}
-	return nil
+	return &gqlNode{typ: "FileConnection", kids: kids}
 }
 
-// gqlIssueConnectionField answers the nodes/pageInfo/totalCount children of
-// an already-built issues connection.
-func gqlIssueConnectionField(ctx *gqlCtx, value map[string]any, field *gqlField) any {
-	switch field.name {
-	case "nodes":
-		if v, ok := value["__nodes"]; ok {
-			return v
+// ---------------------------------------------------------------------------
+// Root fields, node() and introspection.
+
+// rootField answers one top-level query field. Anything else is an
+// unknown field on Query.
+func (e *gqlEnv) rootField(f *sel) any {
+	switch f.name {
+	case "viewer":
+		return userNode(viewerLogin, viewerID)
+	case "repository":
+		args := resolvedArgs(f, e.vars)
+		repo := e.store.GetRepo(argStr(args, "owner"), argStr(args, "name"))
+		if repo == nil {
+			// Unknown repository: null, deliberately with no error.
+			return nil
 		}
-		return []any{}
-	case "pageInfo":
-		info := value["__pageInfo"].(map[string]any)
-		return selectFields(ctx, "PageInfo", info, field.selections)
+		return repoNode(repo)
+	case "node":
+		args := resolvedArgs(f, e.vars)
+		return e.nodeByID(argStr(args, "id"))
+	case "__type":
+		args := resolvedArgs(f, e.vars)
+		return typeNodeFor(argStr(args, "name"))
+	case "__schema":
+		return map[string]any{"queryType": map[string]any{"name": "Query"}}
 	default:
-		if v, ok := value[field.name]; ok {
-			return v
-		}
+		e.failField("Query", f.name)
 		return nil
 	}
 }
 
-// gqlPullConnectionField answers the children of an already-built PR
-// connection; pageInfo is not served here because the suite never asks
-// a pull-requests connection for one.
-func gqlPullConnectionField(ctx *gqlCtx, value map[string]any, field *gqlField) any {
-	if field.name == "nodes" {
-		if v, ok := value["__nodes"]; ok {
-			return v
-		}
-		return []any{}
+// nodeByID resolves a global id to the object it names. The tag picks the
+// kind — R repository, I issue, P pull request — and each leg re-checks
+// that the decoded repo and number actually exist before answering.
+func (e *gqlEnv) nodeByID(id string) *gqlNode {
+	dec := decodeGlobalId(id)
+	if dec == nil {
+		return nil
 	}
-	if v, ok := value[field.name]; ok {
-		return v
-	}
-	return nil
-}
-
-// gqlFileConnectionField answers the nodes of a files connection.
-func gqlFileConnectionField(ctx *gqlCtx, value map[string]any, field *gqlField) any {
-	if field.name == "nodes" {
-		if v, ok := value["nodes"]; ok {
-			return v
+	switch dec.Tag {
+	case "R":
+		repo := e.repoByPart(dec, 0)
+		if repo == nil {
+			return nil
 		}
-		return []any{}
-	}
-	if v, ok := value[field.name]; ok {
-		return v
-	}
-	return nil
-}
-
-// gqlTypeField expands the __Type children: fields and enumValues are
-// stored as name lists and projected through their one-field types.
-func gqlTypeField(ctx *gqlCtx, value map[string]any, field *gqlField) any {
-	switch field.name {
-	case "fields":
-		names := value["__fields"].([]string)
-		out := make([]any, 0, len(names))
-		for _, n := range names {
-			out = append(out, selectFields(ctx, "__Field", map[string]any{"name": n}, field.selections))
+		return repoNode(repo)
+	case "I":
+		repo, issue := e.issueByParts(dec)
+		if repo == nil || issue == nil {
+			return nil
 		}
-		return out
-	case "enumValues":
-		names := value["__enumValues"].([]string)
-		out := make([]any, 0, len(names))
-		for _, n := range names {
-			out = append(out, selectFields(ctx, "__EnumValue", map[string]any{"name": n}, field.selections))
+		return e.issueNode(repo, issue)
+	case "P":
+		repo, pr := e.pullByParts(dec)
+		if repo == nil || pr == nil {
+			return nil
 		}
-		return out
+		return e.prNode(repo, pr)
 	default:
-		if v, ok := value[field.name]; ok {
-			return v
-		}
 		return nil
 	}
 }
 
-// firstNonNil mirrors `v ?? fallback` for a possibly-missing argument: a
-// nil (or absent) value takes the fallback, anything else stands.
-func firstNonNil(v any, fallback any) any {
-	if v == nil {
-		return fallback
+// repoByPart decodes the repo id at parts[i] and loads that repo.
+func (e *gqlEnv) repoByPart(dec *decodedGlobalId, i int) *Repo {
+	if i >= len(dec.Parts) {
+		return nil
 	}
-	return v
+	id, ok := numFromAny(dec.Parts[i])
+	if !ok {
+		return nil
+	}
+	return e.store.GetRepoById(id)
 }
 
-// repositoryValue builds the value map for a repository: its scalar fields
-// plus the *Repo carrier its sub-fields resolve against.
-func repositoryValue(repo *Repo) map[string]any {
-	return map[string]any{
-		"__repo":           repo,
-		"id":               globalId("R", repo.ID),
-		"databaseId":       repo.ID,
-		"name":             repo.Name,
-		"nameWithOwner":    repo.Owner + "/" + repo.Name,
-		"viewerPermission": "ADMIN",
-		"hasIssuesEnabled": true,
+// issueByParts decodes an "I" id (repo id, issue number) and loads both.
+func (e *gqlEnv) issueByParts(dec *decodedGlobalId) (*Repo, *Issue) {
+	repo := e.repoByPart(dec, 0)
+	if repo == nil {
+		return nil, nil
+	}
+	if len(dec.Parts) < 2 {
+		return repo, nil
+	}
+	num, ok := numFromAny(dec.Parts[1])
+	if !ok {
+		return repo, nil
+	}
+	return repo, e.store.GetIssue(repo, num)
+}
+
+// pullByParts decodes a "P" id (repo id, PR number) and loads both.
+func (e *gqlEnv) pullByParts(dec *decodedGlobalId) (*Repo, *Pull) {
+	repo := e.repoByPart(dec, 0)
+	if repo == nil {
+		return nil, nil
+	}
+	if len(dec.Parts) < 2 {
+		return repo, nil
+	}
+	num, ok := numFromAny(dec.Parts[1])
+	if !ok {
+		return repo, nil
+	}
+	return repo, e.store.GetPull(repo, num)
+}
+
+// typeNodeFor answers __type(name:) from the catalog. An enum type
+// reports kind ENUM and its values; an object type reports kind OBJECT
+// and its fields. Unknown names answer null.
+func typeNodeFor(name string) *gqlNode {
+	info, ok := typeCatalog[name]
+	if !ok {
+		return nil
+	}
+	kind := "OBJECT"
+	if info.enumValues != nil {
+		kind = "ENUM"
+	}
+	return &gqlNode{
+		typ:        "Type",
+		vals:       map[string]any{"name": name, "kind": kind},
+		fieldNames: info.fields,
+		enumNames:  info.enumValues,
 	}
 }
 
@@ -1155,99 +1069,101 @@ func repositoryValue(repo *Repo) map[string]any {
 //
 // Each mutation reads its `input` object, decodes the global id(s) in it,
 // performs the store operation, and answers with the payload the document
-// selected (issue / pullRequest / commentEdge). A mutation that cannot find
-// its target records an error and answers null for the whole payload — the
-// same shape the reference implementation produces, so clients see
-// "repository not found" / "issue not found" / "pull request not found" /
-// "subject not found" exactly as before.
+// selected (issue / pullRequest / commentEdge). A mutation that cannot
+// find its target records an error and answers null for the whole payload.
 
-func executeMutation(ctx *gqlCtx, field *gqlField) map[string]any {
-	args := make(map[string]any, len(field.args))
-	for k, v := range field.args {
-		args[k] = resolveVariables(v, ctx.variables)
+// childSels picks the sub-selection named name out of a field's children,
+// or nil when the field does not select it. Mutation payloads and
+// connections both read their nested objects this way.
+func childSels(f *sel, name string) []*sel {
+	for _, k := range f.kids {
+		if k.name == name {
+			return k.kids
+		}
 	}
-	input := asRecord(args["input"])
-	key := fieldKey(field)
+	return nil
+}
 
-	switch field.name {
+func (e *gqlEnv) runMutation(f *sel, key string) map[string]any {
+	args := resolvedArgs(f, e.vars)
+	input := asRecord(args["input"])
+	switch f.name {
 	case "createIssue":
-		return gqlCreateIssue(ctx, input, field, key)
+		return e.mutCreateIssue(f, key, input)
 	case "closeIssue":
-		return gqlCloseIssue(ctx, input, field, key)
+		return e.mutCloseIssue(f, key, input)
 	case "createPullRequest":
-		return gqlCreatePullRequest(ctx, input, field, key)
+		return e.mutCreatePullRequest(f, key, input)
 	case "mergePullRequest":
-		return gqlMergePullRequest(ctx, input, field, key)
+		return e.mutMergePullRequest(f, key, input)
 	case "addComment":
-		return gqlAddComment(ctx, input, field, key)
+		return e.mutAddComment(f, key, input)
 	default:
-		ctx.errors = append(ctx.errors, map[string]any{"message": fmt.Sprintf("Cannot query field \"%s\" on type \"Mutation\".", field.name)})
+		e.failField("Mutation", f.name)
 		return map[string]any{key: nil}
 	}
 }
 
-// gqlRepoFromGlobalId decodes a repository global id ("R:<dbId>") and loads
+// repoFromGlobalID decodes a repository global id ("R:<dbId>") and loads
 // the repo, or nil when the id is malformed or the repo does not exist.
-func gqlRepoFromGlobalId(ctx *gqlCtx, raw string) *Repo {
-	decoded := decodeGlobalId(raw)
-	if decoded == nil || decoded.Tag != "R" {
+func (e *gqlEnv) repoFromGlobalID(raw string) *Repo {
+	dec := decodeGlobalId(raw)
+	if dec == nil || dec.Tag != "R" {
 		return nil
 	}
-	return gqlRepoFromParts(ctx, decoded, 0)
+	return e.repoByPart(dec, 0)
 }
 
-// gqlCreateIssue handles createIssue(input: {repositoryId, title, body}).
-func gqlCreateIssue(ctx *gqlCtx, input map[string]any, field *gqlField, key string) map[string]any {
-	repo := gqlRepoFromGlobalId(ctx, jsString(firstNonNil(input["repositoryId"], "")))
+// mutCreateIssue handles createIssue(input: {repositoryId, title, body}).
+func (e *gqlEnv) mutCreateIssue(f *sel, key string, input map[string]any) map[string]any {
+	repo := e.repoFromGlobalID(argStr(input, "repositoryId"))
 	if repo == nil {
-		ctx.errors = append(ctx.errors, map[string]any{"message": "repository not found"})
+		e.errs = append(e.errs, map[string]any{"message": "repository not found"})
 		return map[string]any{key: nil}
 	}
-	issue := ctx.store.CreateIssue(repo,
-		jsString(firstNonNil(input["title"], "")),
-		jsString(firstNonNil(input["body"], "")),
-		[]string{},
-	)
+	issue := e.store.CreateIssue(repo, argStr(input, "title"), argStr(input, "body"), []string{})
 	return map[string]any{key: map[string]any{
-		"issue": issueValue(ctx, repo, issue.Number, gqlChild(field, "issue")),
+		"issue": e.project(e.issueNode(repo, issue), childSels(f, "issue")),
 	}}
 }
 
-// gqlCloseIssue handles closeIssue(input: {issueId}). Closing bumps the
+// mutCloseIssue handles closeIssue(input: {issueId}). Closing bumps the
 // issue's update sequence and clears its cached REST rendering, so the
 // next REST read sees the closed state.
-func gqlCloseIssue(ctx *gqlCtx, input map[string]any, field *gqlField, key string) map[string]any {
-	decoded := decodeGlobalId(jsString(firstNonNil(input["issueId"], "")))
+func (e *gqlEnv) mutCloseIssue(f *sel, key string, input map[string]any) map[string]any {
+	dec := decodeGlobalId(argStr(input, "issueId"))
 	var repo *Repo
 	var issue *Issue
-	if decoded != nil && decoded.Tag == "I" {
-		repo, issue = gqlIssueFromParts(ctx, decoded)
+	if dec != nil && dec.Tag == "I" {
+		repo, issue = e.issueByParts(dec)
 	}
 	if repo == nil || issue == nil {
-		ctx.errors = append(ctx.errors, map[string]any{"message": "issue not found"})
+		e.errs = append(e.errs, map[string]any{"message": "issue not found"})
 		return map[string]any{key: nil}
 	}
 	issue.State = "closed"
-	issue.UpdatedSeq = ctx.store.nextSeq()
+	issue.UpdatedSeq = e.store.nextSeq()
 	issue.jsonCache = nil
 	return map[string]any{key: map[string]any{
-		"issue": issueValue(ctx, repo, issue.Number, gqlChild(field, "issue")),
+		"issue": e.project(e.issueNode(repo, issue), childSels(f, "issue")),
 	}}
 }
 
-// gqlCreatePullRequest handles createPullRequest(input: {repositoryId,
+// mutCreatePullRequest handles createPullRequest(input: {repositoryId,
 // title, body, headRefName, baseRefName}). An open PR already covering
-// the same head/base pair is returned instead of opening a duplicate —
-// the head branch was pushed before the mutation ran, so the branch must
-// exist; a missing head or base is an error, not an empty PR.
-func gqlCreatePullRequest(ctx *gqlCtx, input map[string]any, field *gqlField, key string) map[string]any {
-	repo := gqlRepoFromGlobalId(ctx, jsString(firstNonNil(input["repositoryId"], "")))
+// the same head/base pair is returned instead of opening a duplicate; a
+// missing head or base branch is an error, not an empty PR.
+func (e *gqlEnv) mutCreatePullRequest(f *sel, key string, input map[string]any) map[string]any {
+	repo := e.repoFromGlobalID(argStr(input, "repositoryId"))
 	if repo == nil {
-		ctx.errors = append(ctx.errors, map[string]any{"message": "repository not found"})
+		e.errs = append(e.errs, map[string]any{"message": "repository not found"})
 		return map[string]any{key: nil}
 	}
-	head := jsString(firstNonNil(input["headRefName"], ""))
-	base := jsString(firstNonNil(input["baseRefName"], repo.DefaultBranch))
+	head := argStr(input, "headRefName")
+	base := argStr(input, "baseRefName")
+	if base == "" {
+		base = repo.DefaultBranch
+	}
 	var pr *Pull
 	for _, p := range repo.Pulls {
 		if p.State == "open" && p.HeadRef == head && p.BaseRef == base {
@@ -1256,70 +1172,66 @@ func gqlCreatePullRequest(ctx *gqlCtx, input map[string]any, field *gqlField, ke
 		}
 	}
 	if pr == nil {
-		pr = ctx.store.CreatePull(repo,
-			jsString(firstNonNil(input["title"], "")),
-			jsString(firstNonNil(input["body"], "")),
-			head, base,
-		)
+		pr = e.store.CreatePull(repo, argStr(input, "title"), argStr(input, "body"), head, base)
 	}
 	if pr == nil {
-		ctx.errors = append(ctx.errors, map[string]any{"message": "head or base branch does not exist"})
+		e.errs = append(e.errs, map[string]any{"message": "head or base branch does not exist"})
 		return map[string]any{key: nil}
 	}
 	return map[string]any{key: map[string]any{
-		"pullRequest": pullValue(ctx, repo, pr, gqlChild(field, "pullRequest")),
+		"pullRequest": e.project(e.prNode(repo, pr), childSels(f, "pullRequest")),
 	}}
 }
 
-// gqlMergePullRequest handles mergePullRequest(input: {pullRequestId}).
+// mutMergePullRequest handles mergePullRequest(input: {pullRequestId}).
 // An open PR is squash-merged; the payload reports the PR as it stands
 // afterwards either way (a conflicted merge leaves it open).
-func gqlMergePullRequest(ctx *gqlCtx, input map[string]any, field *gqlField, key string) map[string]any {
-	decoded := decodeGlobalId(jsString(firstNonNil(input["pullRequestId"], "")))
+func (e *gqlEnv) mutMergePullRequest(f *sel, key string, input map[string]any) map[string]any {
+	dec := decodeGlobalId(argStr(input, "pullRequestId"))
 	var repo *Repo
 	var pr *Pull
-	if decoded != nil && decoded.Tag == "P" {
-		repo, pr = gqlPullFromParts(ctx, decoded)
+	if dec != nil && dec.Tag == "P" {
+		repo, pr = e.pullByParts(dec)
 	}
 	if repo == nil || pr == nil {
-		ctx.errors = append(ctx.errors, map[string]any{"message": "pull request not found"})
+		e.errs = append(e.errs, map[string]any{"message": "pull request not found"})
 		return map[string]any{key: nil}
 	}
 	if pr.State == "open" {
-		ctx.store.MergePull(repo, pr)
+		e.store.MergePull(repo, pr)
 	}
 	return map[string]any{key: map[string]any{
-		"pullRequest": pullValue(ctx, repo, pr, gqlChild(field, "pullRequest")),
+		"pullRequest": e.project(e.prNode(repo, pr), childSels(f, "pullRequest")),
 	}}
 }
 
-// gqlAddComment handles addComment(input: {subjectId, body}). The subject
+// mutAddComment handles addComment(input: {subjectId, body}). The subject
 // is an issue global id; the answer nests the new comment under
 // commentEdge.node with its own opaque id ("C:<repo>:<issue>:<comment>").
-func gqlAddComment(ctx *gqlCtx, input map[string]any, field *gqlField, key string) map[string]any {
-	decoded := decodeGlobalId(jsString(firstNonNil(input["subjectId"], "")))
+func (e *gqlEnv) mutAddComment(f *sel, key string, input map[string]any) map[string]any {
+	dec := decodeGlobalId(argStr(input, "subjectId"))
 	var repo *Repo
 	var issue *Issue
-	if decoded != nil && decoded.Tag == "I" {
-		repo, issue = gqlIssueFromParts(ctx, decoded)
+	if dec != nil && dec.Tag == "I" {
+		repo, issue = e.issueByParts(dec)
 	}
 	if repo == nil || issue == nil {
-		ctx.errors = append(ctx.errors, map[string]any{"message": "subject not found"})
+		e.errs = append(e.errs, map[string]any{"message": "subject not found"})
 		return map[string]any{key: nil}
 	}
-	comment := ctx.store.AddComment(repo, issue, jsString(firstNonNil(input["body"], "")))
-	var nodeSel []*gqlField
-	for _, edge := range field.selections {
+	comment := e.store.AddComment(repo, issue, argStr(input, "body"))
+	var nodeKids []*sel
+	for _, edge := range f.kids {
 		if edge.name == "commentEdge" {
-			nodeSel = gqlChild(edge, "node")
+			nodeKids = childSels(edge, "node")
 		}
 	}
 	return map[string]any{key: map[string]any{
 		"commentEdge": map[string]any{
-			"node": selectFields(ctx, "Comment", map[string]any{
+			"node": e.project(&gqlNode{typ: "Comment", vals: map[string]any{
 				"id":   globalId("C", repo.ID, issue.Number, comment.ID),
 				"body": comment.Body,
-			}, nodeSel),
+			}}, nodeKids),
 		},
 	}}
 }
@@ -1327,38 +1239,39 @@ func gqlAddComment(ctx *gqlCtx, input map[string]any, field *gqlField, key strin
 // ---------------------------------------------------------------------------
 // Operation execution: one parsed document becomes one response object.
 
-// executeOperation tokenizes, parses, and runs a single GraphQL document.
-// A document that does not parse answers data null with the parse error;
+// runDoc tokenizes, parses, and runs a single GraphQL document. A
+// document that does not parse answers data null with the parse error;
 // otherwise data holds one entry per top-level field, and errors appears
 // only when at least one field recorded one.
-func executeOperation(store *Store, query string, variables map[string]any) map[string]any {
-	ctx := &gqlCtx{store: store, variables: variables}
-	parser := &gqlParser{tokens: tokenize(query)}
-	operation, err := parser.parseOperation()
+func runDoc(store *Store, query string, vars map[string]any) map[string]any {
+	env := &gqlEnv{store: store, vars: vars}
+	op, err := parseDoc(lexDoc(query))
 	if err != nil {
-		return map[string]any{"data": nil, "errors": []map[string]any{{"message": err.Error()}}}
+		return map[string]any{"data": nil, "errors": []any{map[string]any{"message": err.Error()}}}
 	}
-	data := make(map[string]any, len(operation.selections))
-	if operation.kind == "mutation" {
-		for _, field := range operation.selections {
-			for k, v := range executeMutation(ctx, field) {
+	data := make(map[string]any, len(op.fields))
+	if op.mutation {
+		for _, f := range op.fields {
+			key := f.name
+			if f.alias != "" {
+				key = f.alias
+			}
+			for k, v := range env.runMutation(f, key) {
 				data[k] = v
 			}
 		}
 	} else {
-		for _, field := range operation.selections {
-			key := fieldKey(field)
-			switch field.name {
-			case "viewer", "repository", "node", "__type", "__schema":
-				data[key] = resolveField(ctx, "Query", map[string]any{}, field)
-			default:
-				data[key] = unknownField(ctx, "Query", field.name)
+		for _, f := range op.fields {
+			key := f.name
+			if f.alias != "" {
+				key = f.alias
 			}
+			data[key] = env.render(env.rootField(f), f.kids)
 		}
 	}
 	out := map[string]any{"data": data}
-	if len(ctx.errors) > 0 {
-		out["errors"] = ctx.errors
+	if len(env.errs) > 0 {
+		out["errors"] = env.errs
 	}
 	return out
 }
@@ -1379,7 +1292,7 @@ func (s *server) handleGraphQL(r *http.Request, w *respWriter, pathname string, 
 		return false
 	}
 	if r.Method != "POST" {
-		s.sendJsonPlain(w, 405, map[string]any{"data": nil, "errors": []map[string]any{{"message": "method not allowed"}}})
+		s.sendJsonPlain(w, 405, map[string]any{"data": nil, "errors": []any{map[string]any{"message": "method not allowed"}}})
 		return true
 	}
 	if !s.isAuthorized(r) {
@@ -1388,21 +1301,21 @@ func (s *server) handleGraphQL(r *http.Request, w *respWriter, pathname string, 
 	}
 	parsed, err := parseJSON(rawBody)
 	if err != nil {
-		s.sendJsonPlain(w, 400, map[string]any{"data": nil, "errors": []map[string]any{{"message": "request body is not valid JSON"}}})
+		s.sendJsonPlain(w, 400, map[string]any{"data": nil, "errors": []any{map[string]any{"message": "request body is not valid JSON"}}})
 		return true
 	}
 	if batch, ok := parsed.([]any); ok {
 		results := make([]any, 0, len(batch))
 		for _, entry := range batch {
-			op := asRecord(entry)
-			query, _ := op["query"].(string)
-			results = append(results, executeOperation(s.store, query, asRecord(op["variables"])))
+			rec := asRecord(entry)
+			query, _ := rec["query"].(string)
+			results = append(results, runDoc(s.store, query, asRecord(rec["variables"])))
 		}
 		s.sendJsonPlain(w, 200, results)
 		return true
 	}
-	op := asRecord(parsed)
-	query, _ := op["query"].(string)
-	s.sendJsonPlain(w, 200, executeOperation(s.store, query, asRecord(op["variables"])))
+	rec := asRecord(parsed)
+	query, _ := rec["query"].(string)
+	s.sendJsonPlain(w, 200, runDoc(s.store, query, asRecord(rec["variables"])))
 	return true
 }

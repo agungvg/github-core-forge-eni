@@ -1,24 +1,20 @@
-// main.go — the handshake between this forge and the trial harness.
+// main.go — the boot handshake with the trial harness ("the env").
 //
-// The harness (the "env") is the only client that matters at boot. It
-// owns port 8080, waits for this process to announce the port it bound,
-// probes GET /healthz on that port, runs the conformance suite and the
-// timed workloads against it, and finally answers GET /done with
-// {"done": true}. Everything in this file is that handshake; the forge
-// itself is built by app.go and the modules behind it.
+// The env owns port 8080 and is the only thing this process talks to
+// before the suite starts driving it. The handshake has four steps:
 //
-// The sequence:
-//  1. Read MAKEFUN_ENV_URL. With no env to talk to there is nothing to
-//     do, so the process exits 1 right away.
+//  1. Read MAKEFUN_ENV_URL. Without it there is no env to announce to,
+//     so the process stops immediately with exit code 1.
 //  2. Build the forge and listen on port 0, letting the kernel pick a
-//     free port. Port 8080 belongs to the env and is never bound here.
-//  3. POST {"port": <the bound port>} to <env>/register, retrying until
-//     the env takes it. A 409 means another entry registered first; that
-//     is not an error for this process, which simply waits like any
-//     other.
+//     free port. Port 8080 is the env's and is never bound here.
+//  3. POST {"port": <bound port>} to <env>/register, retrying until the
+//     env accepts it. A 409 means a registration already won; that is
+//     fine, this process just waits like any other.
 //  4. Poll GET <env>/done until it answers {"done": true}, then shut
-//     the server down and exit 0. The process never leaves early on its
-//     own say-so.
+//     the server down and exit 0. The process never leaves early.
+//
+// Nothing else lives here: the forge itself is assembled by app.go and
+// the modules behind it.
 
 package main
 
@@ -33,171 +29,149 @@ import (
 	"time"
 )
 
-// callTimeout bounds any single request to the env; a slower env is
-// treated as not-ready-yet and retried.
-const callTimeout = 30 * time.Second
+// envCallTimeout bounds one request to the env. A slower env is treated
+// as not ready yet and the call is retried.
+const envCallTimeout = 30 * time.Second
 
-// backoffFirst is the wait after the first failed attempt; backoffLimit
-// is the longest wait between attempts.
-const backoffFirst = 250 * time.Millisecond
-const backoffLimit = 2000 * time.Millisecond
-
-// pause sleeps for d. It exists so the retry loop reads as intent rather
-// than a bare time.Sleep call.
-func pause(d time.Duration) { time.Sleep(d) }
-
-// backoffAfter returns the wait following the nth failure: exponential
-// growth from backoffFirst, capped at backoffLimit. The shift count is
-// clamped so the multiplication can never overflow.
-func backoffAfter(failures int) time.Duration {
-	if failures > 8 {
-		failures = 8
-	}
-	wait := backoffFirst * time.Duration(1<<uint(failures))
-	if wait > backoffLimit {
-		return backoffLimit
-	}
-	return wait
+// retryDelays is the pause before each retry, in order. The first
+// failures wait briefly; later ones back off to two seconds and stay
+// there, so a stuck boot stays visible in the logs without hammering
+// the env.
+var retryDelays = []time.Duration{
+	250 * time.Millisecond,
+	500 * time.Millisecond,
+	1 * time.Second,
+	2 * time.Second,
 }
 
-// fatalEnvError is thrown by a step when the env's answer means the
-// contract itself is wrong — a bad request, a wrong method. Unlike a
-// dropped connection or a slow env, that will not heal by retrying, so
-// it ends the process instead of looping forever.
-type fatalEnvError struct{ msg string }
+// waitForRetry sleeps before attempt n (0-based), capped at the last
+// entry of retryDelays.
+func waitForRetry(n int) {
+	if n >= len(retryDelays) {
+		n = len(retryDelays) - 1
+	}
+	time.Sleep(retryDelays[n])
+}
 
-func (e *fatalEnvError) Error() string { return e.msg }
+// unrecoverable marks an env answer that retrying will never fix — a
+// bad request or a wrong method. It ends the run instead of looping
+// forever; a dropped connection, a timeout or a 5xx is retried.
+type unrecoverable struct{ msg string }
 
-// stepOutcome is what one attempt of a retried step reports: either the
-// step is finished, or it should be tried again after a backoff.
-type stepOutcome int
+func (e *unrecoverable) Error() string { return e.msg }
 
-const (
-	settled stepOutcome = iota // the step is done; stop retrying
-	retry                      // try the step again after a backoff
-)
-
-// keepTrying runs step until it reports settled, backing off between
-// failures. A fatalEnvError ends the run at once; anything else — a
-// refused connection, a timeout, a 5xx — is treated as "the env is not
-// ready yet" and retried, with a log line per failure so a stuck boot
-// is visible in the process output.
-func keepTrying(label string, step func() (stepOutcome, error)) error {
-	failures := 0
+// attempt runs fn once. It reports true when the step is finished, or
+// an error describing why it should be tried again. An
+// *unrecoverable error is returned as-is so the caller can stop.
+func attempt(label string, fn func() (bool, error)) error {
+	tries := 0
 	for {
-		outcome, err := step()
+		done, err := fn()
 		if err != nil {
-			if fatal, ok := err.(*fatalEnvError); ok {
+			if fatal, ok := err.(*unrecoverable); ok {
 				return fatal
 			}
-			fmt.Fprintf(os.Stderr, "entry: %s failed (%s), retrying\n", label, err.Error())
-		} else if outcome == settled {
+			fmt.Fprintf(os.Stderr, "forge: %s failed (%s), retrying\n", label, err)
+		} else if done {
 			return nil
 		}
-		failures++
-		pause(backoffAfter(failures))
+		waitForRetry(tries)
+		tries++
 	}
 }
 
-// envClient builds the HTTP client used for every call to the env.
-func envClient() *http.Client {
-	return &http.Client{Timeout: callTimeout}
-}
-
-// registerStep returns a step that announces port to the env's /register
-// endpoint. 200 is the normal answer and 409 means a first registration
-// already won — both settle the step. 400 and 405 are contract errors
-// and end the program; any other status is retried like a network
-// failure.
-func registerStep(client *http.Client, envBase string, port int) func() (stepOutcome, error) {
-	return func() (stepOutcome, error) {
+// register announces the bound port to the env. 200 is the normal
+// answer and 409 means a first registration already won — both finish
+// the step. 400 and 405 are contract errors and end the program; any
+// other status is retried like a network failure.
+func register(client *http.Client, envBase string, port int) error {
+	return attempt("register", func() (bool, error) {
 		payload := []byte(fmt.Sprintf(`{"port":%d}`, port))
-		req, err := http.NewRequest("POST", envBase+"/register", bytes.NewReader(payload))
+		req, err := http.NewRequest(http.MethodPost, envBase+"/register", bytes.NewReader(payload))
 		if err != nil {
-			return retry, err
+			return false, err
 		}
 		req.Header.Set("content-type", "application/json")
 		res, err := client.Do(req)
 		if err != nil {
-			return retry, err
+			return false, err
 		}
 		defer res.Body.Close()
 		switch res.StatusCode {
-		case 200, 409:
-			return settled, nil
-		case 400, 405:
+		case http.StatusOK, http.StatusConflict:
+			return true, nil
+		case http.StatusBadRequest, http.StatusMethodNotAllowed:
 			text, _ := io.ReadAll(res.Body)
-			return retry, &fatalEnvError{msg: fmt.Sprintf("register answered HTTP %d: %s", res.StatusCode, string(text))}
+			return false, &unrecoverable{msg: fmt.Sprintf("register answered HTTP %d: %s", res.StatusCode, string(text))}
 		default:
-			return retry, nil
+			return false, nil
 		}
-	}
+	})
 }
 
-// doneStep returns a step that polls the env's /done endpoint. It
-// settles only when the body parses as JSON with "done": true; a
-// non-OK answer, a malformed body, or a failed request all mean "not
-// yet".
-func doneStep(client *http.Client, envBase string) func() (stepOutcome, error) {
-	return func() (stepOutcome, error) {
+// waitUntilDone polls the env's /done endpoint. It finishes only when
+// the body parses as JSON with "done": true. A non-2xx answer, a
+// malformed body or a failed request all mean "not yet".
+func waitUntilDone(client *http.Client, envBase string) error {
+	return attempt("done poll", func() (bool, error) {
 		res, err := client.Get(envBase + "/done")
 		if err != nil {
-			return retry, err
+			return false, err
 		}
 		defer res.Body.Close()
 		if res.StatusCode < 200 || res.StatusCode >= 300 {
-			return retry, nil
+			return false, nil
 		}
 		data, err := io.ReadAll(res.Body)
 		if err != nil {
-			return retry, err
+			return false, err
 		}
 		parsed, err := parseJSON(data)
 		if err != nil {
-			return retry, err
+			return false, err
 		}
 		if doc, ok := parsed.(map[string]any); ok {
 			if done, ok := doc["done"].(bool); ok && done {
-				return settled, nil
+				return true, nil
 			}
 		}
-		return retry, nil
-	}
+		return false, nil
+	})
 }
 
 func main() {
 	// The env's base URL, trailing slashes stripped so the paths joined
-	// onto it below are well formed.
+	// onto it below stay well formed.
 	envBase := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
 	if envBase == "" {
-		fmt.Fprint(os.Stderr, "entry: MAKEFUN_ENV_URL is unset, so there is no env to register with\n")
+		fmt.Fprint(os.Stderr, "forge: MAKEFUN_ENV_URL is unset, so there is no env to register with\n")
 		os.Exit(1)
 	}
 
 	srv := newServer()
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "entry: %s\n", err.Error())
+		fmt.Fprintf(os.Stderr, "forge: %s\n", err)
 		os.Exit(1)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	httpServer := &http.Server{Handler: srv}
 	go httpServer.Serve(ln)
-	fmt.Fprintf(os.Stdout, "entry: forge listening on port %d\n", port)
+	fmt.Fprintf(os.Stdout, "forge: listening on port %d\n", port)
 
-	client := envClient()
+	client := &http.Client{Timeout: envCallTimeout}
 
-	if err := keepTrying("register", registerStep(client, envBase, port)); err != nil {
-		fmt.Fprintf(os.Stderr, "entry: %s\n", err.Error())
+	if err := register(client, envBase, port); err != nil {
+		fmt.Fprintf(os.Stderr, "forge: %s\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprint(os.Stdout, "entry: registered with the env, waiting for done\n")
+	fmt.Fprint(os.Stdout, "forge: registered with the env, waiting for done\n")
 
-	if err := keepTrying("done poll", doneStep(client, envBase)); err != nil {
-		fmt.Fprintf(os.Stderr, "entry: %s\n", err.Error())
+	if err := waitUntilDone(client, envBase); err != nil {
+		fmt.Fprintf(os.Stderr, "forge: %s\n", err)
 		os.Exit(1)
 	}
 	httpServer.Close()
-	fmt.Fprint(os.Stdout, "entry: env said done, exiting\n")
+	fmt.Fprint(os.Stdout, "forge: env said done, exiting\n")
 	os.Exit(0)
 }
